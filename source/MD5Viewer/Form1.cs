@@ -76,6 +76,7 @@ namespace MD5Viewer
             viewport1.IsPaused = true;
             btnPlay.Text       = "\u25B6";
             viewport1.MD5Model.SeekToFrame(timelineSlider.Value);
+            viewport1.MarkModelDirty();
             viewport1.Invalidate();
             scrubbingTimeline  = false;
         }

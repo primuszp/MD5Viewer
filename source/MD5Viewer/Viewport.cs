@@ -50,11 +50,12 @@ namespace MD5Viewer
         private int normalTextureId;
         private int specularTextureId;
         private int modelBufferBytes;
-        private int   vertexCount;                // total vertex count (kept for compatibility)
-        private int[] meshVertexOffsets = [];     // first vertex of each mesh
-        private int[] meshVertexCounts  = [];     // vertex count of each mesh
-        private string[] meshShaders    = [];     // shader path of each mesh
+        private int   vertexCount;
+        private int[] meshVertexOffsets = [];
+        private int[] meshVertexCounts  = [];
+        private string[] meshShaders    = [];
         private bool glReady;
+        private bool modelDirty;
         private bool normalYFlip = false;
         private bool flipWinding = false;
 
@@ -207,6 +208,8 @@ namespace MD5Viewer
             set { flipWinding = value; Invalidate(); }
         }
 
+        public void MarkModelDirty() => modelDirty = true;
+
         protected override void OnMouseMove(MouseEventArgs e)
         {
             base.OnMouseMove(e);
@@ -252,6 +255,7 @@ namespace MD5Viewer
             normalTextureId = File.Exists(normalFile) ? BuildTexture(normalFile, false) : BuildFlatNormalTexture();
             specularTextureId = File.Exists(specularFile) ? BuildTexture(specularFile, false) : BuildWhiteTexture();
             UploadModel();
+            modelDirty = false;
             FrameModel();
             Invalidate();
         }
@@ -327,8 +331,15 @@ namespace MD5Viewer
             if (MD5Model != null)
             {
                 if (!IsPaused)
+                {
                     MD5Model.Update(dt);
-                UploadModel();
+                    modelDirty = true;
+                }
+                if (modelDirty)
+                {
+                    UploadModel();
+                    modelDirty = false;
+                }
                 FrameCallback?.Invoke(MD5Model.CurrentFrame, MD5Model.TotalFrames);
             }
 
@@ -386,7 +397,6 @@ namespace MD5Viewer
             int uNormal   = GL.GetUniformLocation(shaderProgram, "uNormalTexture");
             int uSpecular = GL.GetUniformLocation(shaderProgram, "uSpecularTexture");
             int uMode     = GL.GetUniformLocation(shaderProgram, "uMode");
-            int uDiagnostic = GL.GetUniformLocation(shaderProgram, "uDiagnostic");
 
             for (int m = 0; m < meshVertexCounts.Length; m++)
             {
@@ -411,7 +421,6 @@ namespace MD5Viewer
                     GL.BindTexture(TextureTarget.Texture2D, specularTextureId);
                     GL.Uniform1(uSpecular, 2);
                     GL.Uniform1(uMode, (int)Phase);
-                    GL.Uniform1(uDiagnostic, (Phase == RenderPhase.DiagnosticTBN) ? 1 : 0);
                 }
                 else
                 {
@@ -463,25 +472,6 @@ namespace MD5Viewer
                 offset += count;
             }
 
-            // Debug: print per-mesh UV bounds to help diagnose texture mapping issues
-            try
-            {
-                for (int m = 0; m < meshCount; m++)
-                {
-                    var mesh = MD5Model.Meshes[m];
-                    if (mesh.Length == 0) continue;
-                    Vector2 uvMin = new Vector2(float.MaxValue, float.MaxValue);
-                    Vector2 uvMax = new Vector2(float.MinValue, float.MinValue);
-                    for (int i = 0; i < mesh.Length; i++)
-                    {
-                        uvMin = Vector2.ComponentMin(uvMin, mesh[i].Texture);
-                        uvMax = Vector2.ComponentMax(uvMax, mesh[i].Texture);
-                    }
-                    Debug.WriteLine($"Mesh[{m}] shader={meshShaders[m]} verts={mesh.Length} UVmin=({uvMin.X:F3},{uvMin.Y:F3}) UVmax=({uvMax.X:F3},{uvMax.Y:F3})");
-                }
-            }
-            catch { }
-
             float[] data = new float[vertices.Length * 14];
             for (int i = 0; i < vertices.Length; i++)
             {
@@ -502,7 +492,7 @@ namespace MD5Viewer
                 data[o + 13] = vertices[i].Bitangent.Z;
             }
 
-            vertexCount = vertices.Length;
+            vertexCount  = vertices.Length;
             GL.BindBuffer(BufferTarget.ArrayBuffer, modelVbo);
             int dataBytes = data.Length * sizeof(float);
             if (dataBytes != modelBufferBytes)
@@ -798,7 +788,6 @@ namespace MD5Viewer
             uniform vec3      uLightPosition;
             uniform vec3      uCameraPos;
             uniform int       uMode;
-            uniform int       uDiagnostic;
             uniform int       uNormalYFlip;
 
             out vec4 FragColor;
@@ -907,19 +896,6 @@ namespace MD5Viewer
                     FragColor = vec4(bumpN * 0.5 + 0.5, 1.0);
                 }
                 // ---------------------------------------------------------------
-                // DiagnosticTBN (8): visualize T (red), B (green), N (blue) in world space
-                // ---------------------------------------------------------------
-                else if (uDiagnostic == 1)
-                {
-                    vec3 T = normalize(vTangent);
-                    vec3 B = normalize(vBitangent);
-                    vec3 Nw = normalize(vNormal);
-                    // Map directions to color channels
-                    FragColor = vec4(abs(T), 1.0);
-                    // Blend in bitangent and normal for clearer visualization
-                    FragColor.rgb = FragColor.rgb * 0.5 + vec3(abs(B.x), abs(B.y), abs(Nw.z)) * 0.5;
-                }
-                // ---------------------------------------------------------------
                 // SpecularMap (6): raw specular texture
                 // ---------------------------------------------------------------
                 else if (uMode == 6)
@@ -939,6 +915,16 @@ namespace MD5Viewer
                     float kSpec   = Specular(bumpN, grazL, V, 48.0) * 1.20;
                     vec3 lit      = diffuseLin * (0.15 + relief * 1.40) + specMask * kSpec;
                     FragColor     = vec4(LinearToGamma(lit), 1.0);
+                }
+                // ---------------------------------------------------------------
+                // DiagnosticTBN (8): T → red, B → green, N → blue in world space
+                // ---------------------------------------------------------------
+                else if (uMode == 8)
+                {
+                    vec3 T  = normalize(vTangent);
+                    vec3 B  = normalize(vBitangent);
+                    vec3 Nw = normalize(vNormal);
+                    FragColor = vec4(abs(T) * 0.5 + vec3(abs(B.x), abs(B.y), abs(Nw.z)) * 0.5, 1.0);
                 }
                 // ---------------------------------------------------------------
                 // Missing Doom 3 effect material fallback (98)
