@@ -1,0 +1,19 @@
+# Build output
+**/bin/
+**/obj/
+
+# Visual Studio and user-specific files
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# JetBrains Rider
+.idea/
+*.sln.iml
+
+# Operating system files
+Thumbs.db
+.DS_Store
+
