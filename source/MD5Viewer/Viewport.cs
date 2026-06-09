@@ -917,7 +917,7 @@ namespace MD5Viewer
                     FragColor     = vec4(LinearToGamma(lit), 1.0);
                 }
                 // ---------------------------------------------------------------
-                // DiagnosticTBN (8): T → red, B → green, N → blue in world space
+                // DiagnosticTBN (8): T=red, B=green, N=blue in world space
                 // ---------------------------------------------------------------
                 else if (uMode == 8)
                 {
