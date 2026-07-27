@@ -398,11 +398,8 @@ namespace MD5Viewer
                     {
                         numAnimatedComponents = buffer.Ints[0];
 
-                        if (numAnimatedComponents > 0)
-                        {
-                            //Allocate memory for animation frame data
-                            animFrameData = new float[numAnimatedComponents];
-                        }
+                        //Allocate memory for animation frame data (zero-length is valid: a pure pose with no animated joints)
+                        animFrameData = new float[numAnimatedComponents];
                     }
 
                     //After reading the header, comes the skeleton hierarchy.
@@ -478,7 +475,7 @@ namespace MD5Viewer
                     //frameIndex (int) is the index of the frame
 
                     
-                    if (ParseLine(ref buffer, line, "frame %i"))
+                    if (ParseLine(ref buffer, line, "frame %i {"))
                     {
                         frameIndex = buffer.Ints[0];
 
@@ -612,6 +609,18 @@ namespace MD5Viewer
                     //Concatenate rotations
                     md5anim.SkelFrames[frameIndex, i].Orient = MyMath.Mult(ref parentJoint.Orient, ref animatedOrient);
                     md5anim.SkelFrames[frameIndex, i].Orient = MyMath.Normalize(ref md5anim.SkelFrames[frameIndex, i].Orient);
+                }
+
+                MD5Joint builtJoint = md5anim.SkelFrames[frameIndex, i];
+                if (!float.IsFinite(builtJoint.Pos.X) ||
+                    !float.IsFinite(builtJoint.Pos.Y) ||
+                    !float.IsFinite(builtJoint.Pos.Z) ||
+                    !float.IsFinite(builtJoint.Orient.X) ||
+                    !float.IsFinite(builtJoint.Orient.Y) ||
+                    !float.IsFinite(builtJoint.Orient.Z) ||
+                    !float.IsFinite(builtJoint.Orient.W))
+                {
+                    throw new InvalidDataException($"Animation produced an invalid joint at frame {frameIndex}, joint {i}.");
                 }
             }
         }
@@ -748,6 +757,13 @@ namespace MD5Viewer
                         }
                     }
                     finalVertices[i] = finalVertex;
+
+                    if (!float.IsFinite(finalVertex.X) ||
+                        !float.IsFinite(finalVertex.Y) ||
+                        !float.IsFinite(finalVertex.Z))
+                    {
+                        throw new InvalidDataException($"Skinning produced an invalid vertex in mesh {k}, vertex {i}.");
+                    }
 
                     if (bindPoseBasisReady)
                     {
@@ -902,6 +918,12 @@ namespace MD5Viewer
             if (str == null)
             {
                 throw new EndOfStreamException("Unexpected end of MD5 file.");
+            }
+
+            int commentStart = str.IndexOf("//", StringComparison.Ordinal);
+            if (commentStart >= 0)
+            {
+                str = str[..commentStart];
             }
 
             str = str.Replace("\t", " ");

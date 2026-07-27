@@ -54,6 +54,9 @@ namespace MD5Viewer
         private int[] meshVertexOffsets = [];
         private int[] meshVertexCounts  = [];
         private string[] meshShaders    = [];
+        private string diffuseFile;
+        private string normalFile;
+        private string specularFile;
         private bool glReady;
         private bool modelDirty;
         private bool normalYFlip = false;
@@ -76,6 +79,14 @@ namespace MD5Viewer
         [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
         public Action<int, int> FrameCallback { get; set; }
 
+        [Browsable(false)]
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public string RenderStatus =>
+            $"GL: {glReady}, vertices: {vertexCount}, center: {modelCenter}, radius: {modelRadius}, distance: {cameraDistance}, pixel: {centerPixel[0]},{centerPixel[1]},{centerPixel[2]}, error: {lastGlError}";
+
+        private ErrorCode lastGlError = ErrorCode.NoError;
+        private readonly byte[] centerPixel = new byte[4];
+
         public Viewport()
         {
             InitializeComponent();
@@ -88,6 +99,11 @@ namespace MD5Viewer
             if (!TryMakeCurrent()) return;
             InitializeOpenGl();
             glReady = true;
+
+            if (MD5Model != null)
+            {
+                InitializeSceneResources();
+            }
         }
 
         protected override void OnSizeChanged(EventArgs e)
@@ -241,12 +257,21 @@ namespace MD5Viewer
         public void LoadScene(MD5Model model, string diffuseFile, string normalFile, string specularFile)
         {
             MD5Model = model;
+            this.diffuseFile = diffuseFile;
+            this.normalFile = normalFile;
+            this.specularFile = specularFile;
 
             if (!glReady)
             {
+                modelDirty = true;
                 return;
             }
 
+            InitializeSceneResources();
+        }
+
+        private void InitializeSceneResources()
+        {
             if (!TryMakeCurrent()) return;
             DeleteTexture(ref diffuseTextureId);
             DeleteTexture(ref normalTextureId);
@@ -358,6 +383,8 @@ namespace MD5Viewer
 
             GL.BindVertexArray(0);
             GL.UseProgram(0);
+            GL.ReadPixels(Width / 2, Height / 2, 1, 1, PixelFormat.Rgba, PixelType.UnsignedByte, centerPixel);
+            lastGlError = GL.GetError();
             SwapBuffers();
         }
 

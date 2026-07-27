@@ -86,30 +86,33 @@ namespace MD5Viewer
 
         public static Quaternion Slerp(ref Quaternion qa, ref Quaternion qb, float t)
         {
-            Quaternion outr = new Quaternion();
+            Quaternion from = qa;
+            Quaternion to = qb;
+            Normalize(ref from);
+            Normalize(ref to);
 
             // check for out-of range parameter and return edge points if so
             if (t <= 0.0)
             {
-                return qa;
+                return from;
             }
 
             if (t >= 1.0)
             {
-                return qb;
+                return to;
             }
 
             // compute "cosine of angle between quaternions" using dot product
-            float cosOmega = DotProduct(ref qa, ref qb);
+            float cosOmega = DotProduct(ref from, ref to);
 
             // if negative dot, use -q1. two quaternions q and -q
             // represent the same Rotation, but may produce
             // different slerp. we chose q or -q to rotate using
             // the acute angle.
-            float q1w = qb.W;
-            float q1x = qb.Xyz.X;
-            float q1y = qb.Xyz.Y;
-            float q1z = qb.Xyz.Z;
+            float q1w = to.W;
+            float q1x = to.Xyz.X;
+            float q1y = to.Xyz.Y;
+            float q1z = to.Xyz.Z;
 
             if (cosOmega < 0.0f)
             {
@@ -120,12 +123,9 @@ namespace MD5Viewer
                 cosOmega = -cosOmega;
             }
 
-            // we should have two unit quaternions, so dot should be <= 1.0
-            // assert( cosOmega < 1.1f );
-            if (cosOmega >= 1.1f)
-            {
-               // Log.WriteDebugLine("Quaternion error: Slerp");
-            }
+            // Floating-point drift can make the dot product slightly greater
+            // than one, which would make sqrt(1 - cos²) return NaN.
+            cosOmega = Math.Clamp(cosOmega, 0.0f, 1.0f);
 
             // compute interpolation fraction, checking for quaternions
             // almost exactly the same
@@ -161,12 +161,13 @@ namespace MD5Viewer
             }
 
             // interpolate and return new quaternion
-            outr.W = (k0 * qa.W) + (k1 * q1w);
-            outr.X = (k0 * qa.Xyz.X) + (k1 * q1x);
-            outr.Y = (k0 * qa.Xyz.Y) + (k1 * q1y);
-            outr.Z = (k0 * qa.Xyz.Z) + (k1 * q1z);
+            Quaternion outr = new Quaternion();
+            outr.W = (k0 * from.W) + (k1 * q1w);
+            outr.X = (k0 * from.Xyz.X) + (k1 * q1x);
+            outr.Y = (k0 * from.Xyz.Y) + (k1 * q1y);
+            outr.Z = (k0 * from.Xyz.Z) + (k1 * q1z);
 
-            return outr;
+            return Normalize(ref outr);
         }
 
         public static float DotProduct(ref Quaternion qa, ref Quaternion qb)

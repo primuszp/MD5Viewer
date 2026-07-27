@@ -37,8 +37,15 @@ namespace MD5Viewer
         protected override void OnShown(EventArgs e)
         {
             base.OnShown(e);
-            LoadAnimationList();
-            LoadCyberdemon();
+            try
+            {
+                LoadAnimationList();
+                LoadCyberdemon();
+            }
+            catch (Exception exception)
+            {
+                Text = exception.Message;
+            }
         }
 
         // ── toolbar events ────────────────────────────────────────────────
@@ -93,6 +100,7 @@ namespace MD5Viewer
             timelineSlider.Maximum = totalFrames - 1;
             timelineSlider.Value   = Math.Clamp(currentFrame, 0, totalFrames - 1);
             lblFrameInfo.Text      = $"{currentFrame + 1} / {totalFrames}";
+            Text = $"MD5 Viewer — {viewport1.RenderStatus}";
         }
 
         // ── model loading ─────────────────────────────────────────────────
