@@ -196,6 +196,13 @@ namespace MD5Viewer
 
         public void Load(string filename)
         {
+            ArgumentException.ThrowIfNullOrWhiteSpace(filename);
+
+            animations.Clear();
+            curAnim = default;
+            animated = false;
+            bindPoseBasisReady = false;
+            meshes.Clear();
             meshIndex = 0;
             string line = "";
             TextBuffer buffer = new TextBuffer();
@@ -229,10 +236,10 @@ namespace MD5Viewer
                     {
                         for (int i = 0; i < numJoints; i++)
                         {
-                            line = file.ReadLine();
+                            line = ReadRequiredLine(file, "joint");
                             CleanString(ref line);
 
-                            ParseLine(ref buffer, line, "%s %i ( %f %f %f ) ( %f %f %f )");
+                            RequireParsed(ref buffer, line, "%s %i ( %f %f %f ) ( %f %f %f )", filename);
                             bPSkeleton[i].Name = buffer.String;
                             bPSkeleton[i].Parent = buffer.Ints[0];
                             bPSkeleton[i].Pos.X = buffer.Floats[0];
@@ -250,7 +257,7 @@ namespace MD5Viewer
                     {
                         while (!line.Equals("}"))
                         {
-                            line = file.ReadLine();
+                            line = ReadRequiredLine(file, "mesh");
                             CleanString(ref line);
 
                             // Read texture name
@@ -272,8 +279,8 @@ namespace MD5Viewer
 
                                 for (int i = 0; i < model[meshIndex].NumVert; i++)
                                 {
-                                    line = file.ReadLine();
-                                    ParseLine(ref buffer, line, "vert %i ( %f %f ) %i %i");
+                                    line = ReadRequiredLine(file, "vertex");
+                                    RequireParsed(ref buffer, line, "vert %i ( %f %f ) %i %i", filename);
                                     model[meshIndex].Verts[buffer.Ints[0]].UV.X = buffer.Floats[0];
                                     model[meshIndex].Verts[buffer.Ints[0]].UV.Y = buffer.Floats[1];
                                     model[meshIndex].Verts[buffer.Ints[0]].StartWeight = buffer.Ints[1];
@@ -286,8 +293,8 @@ namespace MD5Viewer
                                 model[meshIndex].Faces = new int[model[meshIndex].NumTris][];
                                 for (int i = 0; i < model[meshIndex].NumTris; i++)
                                 {
-                                    line = file.ReadLine();
-                                    ParseLine(ref buffer, line, "tri %i %i %i %i");
+                                    line = ReadRequiredLine(file, "triangle");
+                                    RequireParsed(ref buffer, line, "tri %i %i %i %i", filename);
 
                                     model[meshIndex].Faces[buffer.Ints[0]] = new int[3];
                                     model[meshIndex].Faces[buffer.Ints[0]][0] = buffer.Ints[3];
@@ -301,8 +308,8 @@ namespace MD5Viewer
                                 model[meshIndex].Weights = new MD5Weight[model[meshIndex].NumWeights];
                                 for (int i = 0; i < model[meshIndex].NumWeights; i++)
                                 {
-                                    line = file.ReadLine();
-                                    ParseLine(ref buffer, line, "weight %i %i %f ( %f %f %f )");
+                                    line = ReadRequiredLine(file, "weight");
+                                    RequireParsed(ref buffer, line, "weight %i %i %f ( %f %f %f )", filename);
                                     model[meshIndex].Weights[buffer.Ints[0]].Joint = buffer.Ints[1];
                                     model[meshIndex].Weights[buffer.Ints[0]].Bias = buffer.Floats[0];
                                     model[meshIndex].Weights[buffer.Ints[0]].Pos.X = buffer.Floats[1];
@@ -316,13 +323,23 @@ namespace MD5Viewer
                 }
             }
 
-
+            if (versionNr != 10 || numJoints <= 0 || numMeshes <= 0 || meshIndex != numMeshes)
+            {
+                throw new InvalidDataException($"Invalid or unsupported MD5 mesh '{filename}'.");
+            }
             InitializeBindPoseBasis();
             ComputingVertexPositions(bPSkeleton);
         }
 
         public void LoadAnim(string animName, string filename)
         {
+            ArgumentException.ThrowIfNullOrWhiteSpace(animName);
+            ArgumentException.ThrowIfNullOrWhiteSpace(filename);
+            if (bPSkeleton == null)
+            {
+                throw new InvalidOperationException("Load a mesh before loading an animation.");
+            }
+
             Animation anim = new Animation();
             TextBuffer buffer = new TextBuffer();
 
@@ -395,11 +412,11 @@ namespace MD5Viewer
                         for (int i = 0; i < anim.NumJoints; ++i)
                         {
                             //Read whole line
-                            line = file.ReadLine();
+                            line = ReadRequiredLine(file, "animation hierarchy");
                             CleanString(ref line);
 
                             //Read joint info
-                            ParseLine(ref buffer, line, "%s %i %i %i");
+                            RequireParsed(ref buffer, line, "%s %i %i %i", filename);
                             jointInfos[i].Name = buffer.String;
                             jointInfos[i].Parent = buffer.Ints[0];
                             jointInfos[i].Flags = buffer.Ints[1];
@@ -413,11 +430,11 @@ namespace MD5Viewer
                         for (int i = 0; i < anim.NumFrames; ++i)
                         {
                             //Read whole line
-                            line = file.ReadLine();
+                            line = ReadRequiredLine(file, "animation bounds");
                             CleanString(ref line);
 
                             //Read bounding box
-                            ParseLine(ref buffer, line, "( %f %f %f ) ( %f %f %f )");
+                            RequireParsed(ref buffer, line, "( %f %f %f ) ( %f %f %f )", filename);
                             anim.Boxes[i].Min.X = buffer.Floats[0];
                             anim.Boxes[i].Min.Y = buffer.Floats[1];
                             anim.Boxes[i].Min.Z = buffer.Floats[2];
@@ -434,11 +451,11 @@ namespace MD5Viewer
                         for (int i = 0; i < anim.NumJoints; ++i)
                         {
                             //Read whole line
-                            line = file.ReadLine();
+                            line = ReadRequiredLine(file, "animation base frame");
                             CleanString(ref line);
 
                             //Read base frame joint
-                            ParseLine(ref buffer, line, "( %f %f %f ) ( %f %f %f )");
+                            RequireParsed(ref buffer, line, "( %f %f %f ) ( %f %f %f )", filename);
 
                             if (buffer.Floats.Length == 6)
                             {
@@ -468,13 +485,23 @@ namespace MD5Viewer
                         //Read frame data
                         for (int i = 0; i < numAnimatedComponents; )
                         {
-                            line = file.ReadLine(); if (line[0] == '}') break;
+                            line = ReadRequiredLine(file, $"animation frame {frameIndex}");
                             CleanString(ref line);
-                            string[] splt = line.Split(' ');
+                            if (line == "}")
+                            {
+                                throw new InvalidDataException($"Animation frame {frameIndex} contains too few components in '{filename}'.");
+                            }
+
+                            string[] splt = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
 
                             for (int ww = 0; ww < splt.Length; ww++)
                             {
-                                animFrameData[i++] = float.Parse(splt[ww], CultureInfo.InvariantCulture);
+                                if (i >= numAnimatedComponents ||
+                                    !float.TryParse(splt[ww], NumberStyles.Float, CultureInfo.InvariantCulture, out animFrameData[i]))
+                                {
+                                    throw new InvalidDataException($"Invalid animation frame data in '{filename}'.");
+                                }
+                                i++;
                             }
                         }
 
@@ -483,7 +510,11 @@ namespace MD5Viewer
                     }
                 }
 
-
+                if (anim.NumFrames <= 0 || anim.NumJoints != numJoints || anim.FrameRate <= 0 ||
+                    anim.SkelFrames == null || jointInfos == null || baseFrame == null || animFrameData == null)
+                {
+                    throw new InvalidDataException($"Invalid or incompatible MD5 animation '{filename}'.");
+                }
                 anim.CurrentFrame = 0;
                 anim.NextFrame = anim.NumFrames > 1 ? 1 : 0;
 
@@ -495,6 +526,7 @@ namespace MD5Viewer
 
                 animated = true;
 
+                animations.RemoveAll(item => item.AnimName == animName);
                 animations.Add(anim);
                 UseAnimation(animName);
                 Update(0);
@@ -603,6 +635,11 @@ namespace MD5Viewer
 
         private void Animate(ref Animation anim, float dt)
         {
+            if (!float.IsFinite(dt) || dt <= 0f)
+            {
+                return;
+            }
+
             anim.LastTime += dt;
             int maxFrames = anim.NumFrames - 1;
 
@@ -862,6 +899,11 @@ namespace MD5Viewer
 
         private void CleanString(ref string str)
         {
+            if (str == null)
+            {
+                throw new EndOfStreamException("Unexpected end of MD5 file.");
+            }
+
             str = str.Replace("\t", " ");
             str = str.Replace("\"", " ");
             str = str.Trim();
@@ -878,15 +920,25 @@ namespace MD5Viewer
 
         private bool ParseLine(ref TextBuffer buffer, string txt, string str)
         {
+            if (txt == null || str == null)
+            {
+                return false;
+            }
+
             int countFloat = 0, countInt = 0;
 
             CleanString(ref txt);
 
-            txt = txt.ToLower();
-            str = str.ToLower();
+            txt = txt.ToLowerInvariant();
+            str = str.ToLowerInvariant();
 
-            string[] splitTxt = txt.Split(new Char[] { ' ' });
-            string[] splitStr = str.Split(new Char[] { ' ' });
+            string[] splitTxt = txt.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            string[] splitStr = str.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+            if (splitTxt.Length != splitStr.Length)
+            {
+                return false;
+            }
 
             for (int i = 0; i < str.Length - 1; i++)
             {
@@ -903,13 +955,19 @@ namespace MD5Viewer
             {   //Integer
                 if (string.Equals(splitStr[i], "%i"))
                 {
-                    buffer.Ints[countInt] = int.Parse(splitTxt[i]);
+                    if (!int.TryParse(splitTxt[i], NumberStyles.Integer, CultureInfo.InvariantCulture, out buffer.Ints[countInt]))
+                    {
+                        return false;
+                    }
                     countInt++;
                 }
                 else //Float
                     if (string.Equals(splitStr[i], "%f"))
                     {
-                        buffer.Floats[countFloat] = float.Parse(splitTxt[i], CultureInfo.InvariantCulture);
+                        if (!float.TryParse(splitTxt[i], NumberStyles.Float, CultureInfo.InvariantCulture, out buffer.Floats[countFloat]))
+                        {
+                            return false;
+                        }
                         countFloat++;
                     } //String
                     else if (string.Equals(splitStr[i], "%s"))
@@ -918,6 +976,17 @@ namespace MD5Viewer
                         return (false);
             }
             return (true);
+        }
+
+        private static string ReadRequiredLine(StreamReader reader, string section) =>
+            reader.ReadLine() ?? throw new EndOfStreamException($"Unexpected end of MD5 file while reading {section}.");
+
+        private void RequireParsed(ref TextBuffer buffer, string line, string pattern, string filename)
+        {
+            if (!ParseLine(ref buffer, line, pattern))
+            {
+                throw new InvalidDataException($"Invalid MD5 data in '{filename}': '{line}'.");
+            }
         }
     }
 }

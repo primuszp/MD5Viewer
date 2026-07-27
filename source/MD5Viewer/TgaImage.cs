@@ -36,6 +36,11 @@ namespace MD5Viewer
                 throw new NotSupportedException("Color mapped TGA files are not supported.");
             }
 
+            if (width <= 0 || height <= 0)
+            {
+                throw new InvalidDataException("TGA dimensions must be greater than zero.");
+            }
+
             if (imageType != 2 && imageType != 3 && imageType != 10 && imageType != 11)
             {
                 throw new NotSupportedException("Only true-color and grayscale TGA files are supported.");
@@ -47,12 +52,18 @@ namespace MD5Viewer
                 throw new NotSupportedException("Only 8, 24 and 32 bit TGA files are supported.");
             }
 
+            if ((imageType == 3 || imageType == 11) && bytesPerPixel != 1)
+            {
+                throw new NotSupportedException("Grayscale TGA files must use 8 bits per pixel.");
+            }
+
             if (idLength > 0)
             {
                 reader.BaseStream.Seek(idLength, SeekOrigin.Current);
             }
 
-            byte[] rgba = new byte[width * height * 4];
+            int pixelCount = checked(width * height);
+            byte[] rgba = new byte[checked(pixelCount * 4)];
             bool topOrigin = (descriptor & 0x20) != 0;
             bool rightOrigin = (descriptor & 0x10) != 0;
             bool rle = imageType == 10 || imageType == 11;
@@ -63,7 +74,7 @@ namespace MD5Viewer
             }
             else
             {
-                for (int i = 0; i < width * height; i++)
+                for (int i = 0; i < pixelCount; i++)
                 {
                     ReadPixel(reader, out byte r, out byte g, out byte b, out byte a, bytesPerPixel);
                     WritePixel(rgba, i, width, height, topOrigin, rightOrigin, r, g, b, a);

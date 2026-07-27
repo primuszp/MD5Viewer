@@ -672,24 +672,35 @@ namespace MD5Viewer
         private static int CreateShaderProgram(string vertexSource, string fragmentSource)
         {
             int vertexShader = CompileShader(ShaderType.VertexShader, vertexSource);
-            int fragmentShader = CompileShader(ShaderType.FragmentShader, fragmentSource);
-            int program = GL.CreateProgram();
-            GL.AttachShader(program, vertexShader);
-            GL.AttachShader(program, fragmentShader);
-            GL.LinkProgram(program);
-
-            GL.GetProgram(program, GetProgramParameterName.LinkStatus, out int status);
-            if (status == 0)
+            int fragmentShader = 0;
+            int program = 0;
+            try
             {
-                string log = GL.GetProgramInfoLog(program);
-                throw new InvalidOperationException("OpenGL shader link failed: " + log);
-            }
+                fragmentShader = CompileShader(ShaderType.FragmentShader, fragmentSource);
+                program = GL.CreateProgram();
+                GL.AttachShader(program, vertexShader);
+                GL.AttachShader(program, fragmentShader);
+                GL.LinkProgram(program);
 
-            GL.DetachShader(program, vertexShader);
-            GL.DetachShader(program, fragmentShader);
-            GL.DeleteShader(vertexShader);
-            GL.DeleteShader(fragmentShader);
-            return program;
+                GL.GetProgram(program, GetProgramParameterName.LinkStatus, out int status);
+                if (status == 0)
+                {
+                    string log = GL.GetProgramInfoLog(program);
+                    throw new InvalidOperationException("OpenGL shader link failed: " + log);
+                }
+
+                return program;
+            }
+            catch
+            {
+                if (program != 0) GL.DeleteProgram(program);
+                throw;
+            }
+            finally
+            {
+                GL.DeleteShader(vertexShader);
+                if (fragmentShader != 0) GL.DeleteShader(fragmentShader);
+            }
         }
 
         private static int CompileShader(ShaderType type, string source)
@@ -701,6 +712,7 @@ namespace MD5Viewer
             if (status == 0)
             {
                 string log = GL.GetShaderInfoLog(shader);
+                GL.DeleteShader(shader);
                 throw new InvalidOperationException(type + " compile failed: " + log);
             }
 
