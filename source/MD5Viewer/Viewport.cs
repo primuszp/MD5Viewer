@@ -27,6 +27,11 @@ namespace MD5Viewer
 
     public partial class Viewport : GLControl
     {
+        private const int FloatsPerVertex = 14;
+
+        /// <summary>Largest time step fed to the animation, so stalls (window drag, breakpoints) do not cause jumps.</summary>
+        private const float MaxFrameDelta = 0.1f;
+
         private readonly Stopwatch clock = Stopwatch.StartNew();
         private readonly float[] gridVertices;
 
@@ -35,7 +40,7 @@ namespace MD5Viewer
         private Vector3 lightPosition = new Vector3(80, -160, 180);
         private Vector3 cameraEye;
         private float modelRadius = 80f;
-        private float rotx = -12f;
+        private float rotx = 15f;   // camera pitch in degrees (positive = above the target)
         private float roty = 25f;
         private float cameraDistance = 180f;
         private int lastx;
@@ -44,16 +49,20 @@ namespace MD5Viewer
         private int shaderProgram;
         private int modelVao;
         private int modelVbo;
+        private int modelEbo;
         private int gridVao;
         private int gridVbo;
         private int diffuseTextureId;
         private int normalTextureId;
         private int specularTextureId;
         private int modelBufferBytes;
-        private int   vertexCount;
-        private int[] meshVertexOffsets = [];
-        private int[] meshVertexCounts  = [];
-        private string[] meshShaders    = [];
+        private int vertexCount;
+        private int indexCount;
+        private int[] meshIndexOffsets = [];
+        private int[] meshIndexCounts = [];
+        private bool[] meshIsEffect = [];
+        private float[] vertexUploadBuffer = [];
+        private MD5Model uploadedTopology;
         private string diffuseFile;
         private string normalFile;
         private string specularFile;
@@ -61,6 +70,10 @@ namespace MD5Viewer
         private bool modelDirty;
         private bool normalYFlip = false;
         private bool flipWinding = false;
+
+        // Uniform locations, looked up once after linking.
+        private int uModelLoc, uViewLoc, uProjectionLoc, uNormalMatrixLoc;
+        private int uLightPositionLoc, uFillDirectionLoc, uCameraPosLoc, uNormalYFlipLoc, uModeLoc;
 
         [Browsable(false)]
         [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
@@ -82,10 +95,9 @@ namespace MD5Viewer
         [Browsable(false)]
         [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
         public string RenderStatus =>
-            $"GL: {glReady}, vertices: {vertexCount}, center: {modelCenter}, radius: {modelRadius}, distance: {cameraDistance}, pixel: {centerPixel[0]},{centerPixel[1]},{centerPixel[2]}, error: {lastGlError}";
+            $"GL: {glReady}, vertices: {vertexCount}, triangles: {indexCount / 3}, radius: {modelRadius:0.0}, distance: {cameraDistance:0.0}, error: {lastGlError}";
 
         private ErrorCode lastGlError = ErrorCode.NoError;
-        private readonly byte[] centerPixel = new byte[4];
 
         public Viewport()
         {
@@ -166,13 +178,16 @@ namespace MD5Viewer
                 DeleteTexture(ref normalTextureId);
                 DeleteTexture(ref specularTextureId);
                 if (modelVbo != 0) GL.DeleteBuffer(modelVbo);
+                if (modelEbo != 0) GL.DeleteBuffer(modelEbo);
                 if (gridVbo != 0) GL.DeleteBuffer(gridVbo);
                 if (modelVao != 0) GL.DeleteVertexArray(modelVao);
                 if (gridVao != 0) GL.DeleteVertexArray(gridVao);
                 if (shaderProgram != 0) GL.DeleteProgram(shaderProgram);
             }
 
-            modelVbo = gridVbo = modelVao = gridVao = shaderProgram = 0;
+            modelVbo = modelEbo = gridVbo = modelVao = gridVao = shaderProgram = 0;
+            modelBufferBytes = 0;
+            uploadedTopology = null;
             glReady = false;
         }
 
@@ -207,7 +222,6 @@ namespace MD5Viewer
             Invalidate();
         }
 
-        // Expose properties so UI can read/set states directly
         [Browsable(false)]
         [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
         public bool NormalYFlip
@@ -276,9 +290,12 @@ namespace MD5Viewer
             DeleteTexture(ref diffuseTextureId);
             DeleteTexture(ref normalTextureId);
             DeleteTexture(ref specularTextureId);
-            diffuseTextureId = BuildTexture(diffuseFile, true);
+
+            // Colour textures (diffuse, specular) are sRGB-encoded and are decoded to linear
+            // by the sampler; normal maps store vectors and must be sampled as linear data.
+            diffuseTextureId = File.Exists(diffuseFile) ? BuildTexture(diffuseFile, true) : BuildWhiteTexture();
             normalTextureId = File.Exists(normalFile) ? BuildTexture(normalFile, false) : BuildFlatNormalTexture();
-            specularTextureId = File.Exists(specularFile) ? BuildTexture(specularFile, false) : BuildWhiteTexture();
+            specularTextureId = File.Exists(specularFile) ? BuildTexture(specularFile, true) : BuildBlackTexture();
             UploadModel();
             modelDirty = false;
             FrameModel();
@@ -292,29 +309,22 @@ namespace MD5Viewer
 
             lastx = x;
             lasty = y;
-            // Controls mapping now:
             // Left  = rotate/orbit around target
             // Right = pan (translate target in screen space)
             // Wheel = zoom
             if (mb == MouseButtons.Left)
             {
-                // Orbit: change pitch (rotx) and yaw (roty)
                 rotx += 0.45f * diffy;
                 roty += 0.45f * diffx;
                 rotx = MathHelper.Clamp(rotx, -89f, 89f);
             }
             else if (mb == MouseButtons.Right)
             {
-                // Pan: move the model target in camera's right/up plane so panning matches screen movement
+                // Move the target in the camera's right/up plane so panning matches screen movement
                 float panScale = MathF.Max(0.005f, cameraDistance * 0.0015f);
-                float yaw = MathHelper.DegreesToRadians(roty);
-                float pitch = MathHelper.DegreesToRadians(rotx);
-                Vector3 forward = new Vector3(
-                    MathF.Cos(pitch) * MathF.Cos(yaw),
-                    MathF.Cos(pitch) * MathF.Sin(yaw),
-                    MathF.Sin(pitch));
-                Vector3 right = Vector3.Normalize(Vector3.Cross(Vector3.UnitZ, forward));
-                if (right.LengthSquared < 0.0001f) right = Vector3.UnitX;
+                Vector3 forward = OrbitDirection();
+                Vector3 right = Vector3.Cross(Vector3.UnitZ, forward);
+                right = right.LengthSquared < 0.0001f ? Vector3.UnitX : Vector3.Normalize(right);
                 Vector3 camUp = Vector3.Normalize(Vector3.Cross(forward, right));
                 panOffset -= right * (diffx * panScale) + camUp * (diffy * panScale);
             }
@@ -331,26 +341,53 @@ namespace MD5Viewer
             GL.CullFace(TriangleFace.Back);
             GL.FrontFace(FrontFaceDirection.Ccw);
 
+            // Texture rows are tightly packed RGBA8, but make the assumption explicit.
+            GL.PixelStore(PixelStoreParameter.UnpackAlignment, 1);
+
             shaderProgram = CreateShaderProgram(VertexShaderSource, FragmentShaderSource);
+            CacheUniformLocations();
+
             modelVao = GL.GenVertexArray();
             modelVbo = GL.GenBuffer();
+            modelEbo = GL.GenBuffer();
             gridVao = GL.GenVertexArray();
             gridVbo = GL.GenBuffer();
 
-            ConfigureModelVertexArray(modelVao, modelVbo);
+            ConfigureModelVertexArray(modelVao, modelVbo, modelEbo);
             ConfigureGridVertexArray(gridVao, gridVbo);
 
             GL.BindBuffer(BufferTarget.ArrayBuffer, gridVbo);
             GL.BufferData(BufferTarget.ArrayBuffer, gridVertices.Length * sizeof(float), gridVertices, BufferUsageHint.StaticDraw);
+            GL.BindVertexArray(0);
 
             GL.Viewport(0, 0, Width, Height);
+        }
+
+        private void CacheUniformLocations()
+        {
+            uModelLoc = GL.GetUniformLocation(shaderProgram, "uModel");
+            uViewLoc = GL.GetUniformLocation(shaderProgram, "uView");
+            uProjectionLoc = GL.GetUniformLocation(shaderProgram, "uProjection");
+            uNormalMatrixLoc = GL.GetUniformLocation(shaderProgram, "uNormalMatrix");
+            uLightPositionLoc = GL.GetUniformLocation(shaderProgram, "uLightPosition");
+            uFillDirectionLoc = GL.GetUniformLocation(shaderProgram, "uFillDirection");
+            uCameraPosLoc = GL.GetUniformLocation(shaderProgram, "uCameraPos");
+            uNormalYFlipLoc = GL.GetUniformLocation(shaderProgram, "uNormalYFlip");
+            uModeLoc = GL.GetUniformLocation(shaderProgram, "uMode");
+
+            // Sampler units never change, so assign them once.
+            GL.UseProgram(shaderProgram);
+            GL.Uniform1(GL.GetUniformLocation(shaderProgram, "uDiffuseTexture"), 0);
+            GL.Uniform1(GL.GetUniformLocation(shaderProgram, "uNormalTexture"), 1);
+            GL.Uniform1(GL.GetUniformLocation(shaderProgram, "uSpecularTexture"), 2);
+            GL.UseProgram(0);
         }
 
         private void Render()
         {
             if (!TryMakeCurrent()) return;
 
-            float dt = (float)clock.Elapsed.TotalSeconds;
+            float dt = MathF.Min((float)clock.Elapsed.TotalSeconds, MaxFrameDelta);
             clock.Restart();
 
             if (MD5Model != null)
@@ -371,9 +408,11 @@ namespace MD5Viewer
             GL.Clear(ClearBufferMask.ColorBufferBit | ClearBufferMask.DepthBufferBit);
             GL.UseProgram(shaderProgram);
 
-            float nearPlane = MathF.Max(0.05f, modelRadius / 500f);
-            float farPlane = MathF.Max(1000f, cameraDistance + modelRadius * 8f);
-            Matrix4 projection = Matrix4.CreatePerspectiveFieldOfView(MathHelper.DegreesToRadians(45f), MathF.Max(1f, Width) / MathF.Max(1f, Height), nearPlane, farPlane);
+            // Keep the near/far ratio bounded for depth precision.
+            float farPlane = cameraDistance + modelRadius * 4f;
+            float nearPlane = MathF.Max(0.05f, MathF.Min(modelRadius * 0.02f, farPlane / 10000f));
+            float aspect = MathF.Max(1f, Width) / MathF.Max(1f, Height);
+            Matrix4 projection = Matrix4.CreatePerspectiveFieldOfView(MathHelper.DegreesToRadians(45f), aspect, nearPlane, farPlane);
             Matrix4 view = BuildViewMatrix();
 
             SetCommonUniforms(Matrix4.Identity, view, projection);
@@ -383,7 +422,6 @@ namespace MD5Viewer
 
             GL.BindVertexArray(0);
             GL.UseProgram(0);
-            GL.ReadPixels(Width / 2, Height / 2, 1, 1, PixelFormat.Rgba, PixelType.UnsignedByte, centerPixel);
             lastGlError = GL.GetError();
             SwapBuffers();
         }
@@ -392,7 +430,7 @@ namespace MD5Viewer
         {
             GL.Disable(EnableCap.CullFace);
             GL.PolygonMode(TriangleFace.FrontAndBack, PolygonMode.Fill);
-            GL.Uniform1(GL.GetUniformLocation(shaderProgram, "uMode"), 99);
+            GL.Uniform1(uModeLoc, 99);
             GL.BindVertexArray(gridVao);
             GL.DrawArrays(PrimitiveType.Lines, 0, gridVertices.Length / 8);
             GL.Enable(EnableCap.CullFace);
@@ -400,12 +438,11 @@ namespace MD5Viewer
 
         private void DrawModel()
         {
-            if (vertexCount == 0) return;
+            if (indexCount == 0) return;
 
             GL.BindVertexArray(modelVao);
             GL.FrontFace(flipWinding ? FrontFaceDirection.Cw : FrontFaceDirection.Ccw);
 
-            // Set polygon mode once
             switch (Phase)
             {
                 case RenderPhase.Points:
@@ -420,48 +457,35 @@ namespace MD5Viewer
                     break;
             }
 
-            int uDiffuse  = GL.GetUniformLocation(shaderProgram, "uDiffuseTexture");
-            int uNormal   = GL.GetUniformLocation(shaderProgram, "uNormalTexture");
-            int uSpecular = GL.GetUniformLocation(shaderProgram, "uSpecularTexture");
-            int uMode     = GL.GetUniformLocation(shaderProgram, "uMode");
+            // Pass 1: opaque surfaces with depth writes and back-face culling.
+            GL.Enable(EnableCap.CullFace);
+            GL.Disable(EnableCap.Blend);
+            GL.DepthMask(true);
+            GL.ActiveTexture(TextureUnit.Texture0);
+            GL.BindTexture(TextureTarget.Texture2D, diffuseTextureId);
+            GL.ActiveTexture(TextureUnit.Texture1);
+            GL.BindTexture(TextureTarget.Texture2D, normalTextureId);
+            GL.ActiveTexture(TextureUnit.Texture2);
+            GL.BindTexture(TextureTarget.Texture2D, specularTextureId);
+            GL.Uniform1(uModeLoc, (int)Phase);
 
-            for (int m = 0; m < meshVertexCounts.Length; m++)
+            for (int m = 0; m < meshIndexCounts.Length; m++)
             {
-                if (meshVertexCounts[m] == 0) continue;
+                if (!meshIsEffect[m]) DrawMesh(m);
+            }
 
-                string shader = meshShaders.Length > m ? meshShaders[m] : "";
-                bool isMainBody = shader.Contains("cyberdemon", StringComparison.OrdinalIgnoreCase);
+            // Pass 2: Doom 3 effect materials (muzzle flashes, glows) are normally two-sided and
+            // additive. Without their .mtr stages they get an emissive fallback, drawn after all
+            // opaque geometry with depth testing on but depth writes off.
+            GL.Disable(EnableCap.CullFace);
+            GL.Enable(EnableCap.Blend);
+            GL.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.One);
+            GL.DepthMask(false);
+            GL.Uniform1(uModeLoc, 98);
 
-                if (isMainBody)
-                {
-                    GL.Enable(EnableCap.CullFace);
-                    GL.Disable(EnableCap.Blend);
-                    GL.DepthMask(true);
-                    // Full PBR rendering with all textures
-                    GL.ActiveTexture(TextureUnit.Texture0);
-                    GL.BindTexture(TextureTarget.Texture2D, diffuseTextureId);
-                    GL.Uniform1(uDiffuse, 0);
-                    GL.ActiveTexture(TextureUnit.Texture1);
-                    GL.BindTexture(TextureTarget.Texture2D, normalTextureId);
-                    GL.Uniform1(uNormal, 1);
-                    GL.ActiveTexture(TextureUnit.Texture2);
-                    GL.BindTexture(TextureTarget.Texture2D, specularTextureId);
-                    GL.Uniform1(uSpecular, 2);
-                    GL.Uniform1(uMode, (int)Phase);
-                }
-                else
-                {
-                    // Effect materials are commonly two-sided/additive in Doom 3.
-                    // Without their .mtr stages, use an emissive fallback and avoid
-                    // incorrectly culling billboard-like effect geometry.
-                    GL.Disable(EnableCap.CullFace);
-                    GL.Enable(EnableCap.Blend);
-                    GL.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.One);
-                    GL.DepthMask(false);
-                    GL.Uniform1(uMode, 98);
-                }
-
-                GL.DrawArrays(PrimitiveType.Triangles, meshVertexOffsets[m], meshVertexCounts[m]);
+            for (int m = 0; m < meshIndexCounts.Length; m++)
+            {
+                if (meshIsEffect[m]) DrawMesh(m);
             }
 
             GL.PolygonMode(TriangleFace.FrontAndBack, PolygonMode.Fill);
@@ -469,89 +493,137 @@ namespace MD5Viewer
             GL.Disable(EnableCap.Blend);
             GL.Enable(EnableCap.CullFace);
             GL.FrontFace(FrontFaceDirection.Ccw);
+            GL.ActiveTexture(TextureUnit.Texture0);
+        }
+
+        private void DrawMesh(int mesh)
+        {
+            if (meshIndexCounts[mesh] == 0) return;
+            GL.DrawElements(PrimitiveType.Triangles, meshIndexCounts[mesh], DrawElementsType.UnsignedInt, meshIndexOffsets[mesh] * sizeof(uint));
+        }
+
+        /// <summary>
+        /// Without parsing Doom 3 .mtr files the blend stages of a material are unknown, so
+        /// effect surfaces are recognised by the conventional naming of such materials.
+        /// </summary>
+        private static bool IsEffectMaterial(string shader)
+        {
+            if (string.IsNullOrEmpty(shader)) return false;
+            string name = shader.Replace('\\', '/');
+            name = name[(name.LastIndexOf('/') + 1)..];
+
+            string[] markers = ["_fx", "fx_", "flash", "flare", "glow", "smoke", "fire", "spark", "beam"];
+            foreach (string marker in markers)
+            {
+                if (name.Contains(marker, StringComparison.OrdinalIgnoreCase)) return true;
+            }
+            return false;
         }
 
         private void UploadModel()
         {
             if (MD5Model == null)
             {
-                vertexCount = 0;
-                meshVertexOffsets = Array.Empty<int>();
-                meshVertexCounts  = Array.Empty<int>();
-                meshShaders       = Array.Empty<string>();
+                vertexCount = indexCount = 0;
+                meshIndexOffsets = Array.Empty<int>();
+                meshIndexCounts = Array.Empty<int>();
+                meshIsEffect = Array.Empty<bool>();
+                uploadedTopology = null;
                 return;
             }
 
-            // Build per-mesh offset/count/shader tables
-            int meshCount = MD5Model.MeshCount;
-            meshVertexOffsets = new int[meshCount];
-            meshVertexCounts  = new int[meshCount];
-            meshShaders       = new string[meshCount];
-
-            Vertex[] vertices = MD5Model.GetCombinedVertices();
-            int offset = 0;
-            for (int m = 0; m < meshCount; m++)
+            // The topology is static for a model, so the index buffer is uploaded only once.
+            if (!ReferenceEquals(uploadedTopology, MD5Model))
             {
-                int count = MD5Model.Meshes[m].Length;
-                meshVertexOffsets[m] = offset;
-                meshVertexCounts[m]  = count;
-                meshShaders[m]       = MD5Model.GetMeshShader(m);
-                offset += count;
+                UploadIndices();
+                uploadedTopology = MD5Model;
             }
 
-            float[] data = new float[vertices.Length * 14];
-            for (int i = 0; i < vertices.Length; i++)
+            IReadOnlyList<Vertex[]> meshes = MD5Model.MeshVertices;
+            int totalVertices = 0;
+            for (int m = 0; m < meshes.Count; m++) totalVertices += meshes[m].Length;
+
+            int floatCount = totalVertices * FloatsPerVertex;
+            if (vertexUploadBuffer.Length != floatCount)
             {
-                int o = i * 14;
-                data[o + 0] = vertices[i].Position.X;
-                data[o + 1] = vertices[i].Position.Y;
-                data[o + 2] = vertices[i].Position.Z;
-                data[o + 3] = vertices[i].Normal.X;
-                data[o + 4] = vertices[i].Normal.Y;
-                data[o + 5] = vertices[i].Normal.Z;
-                data[o + 6] = vertices[i].Texture.X;
-                data[o + 7] = vertices[i].Texture.Y;
-                data[o + 8] = vertices[i].Tangent.X;
-                data[o + 9] = vertices[i].Tangent.Y;
-                data[o + 10] = vertices[i].Tangent.Z;
-                data[o + 11] = vertices[i].Bitangent.X;
-                data[o + 12] = vertices[i].Bitangent.Y;
-                data[o + 13] = vertices[i].Bitangent.Z;
+                vertexUploadBuffer = new float[floatCount];
             }
 
-            vertexCount  = vertices.Length;
+            float[] data = vertexUploadBuffer;
+            int o = 0;
+            for (int m = 0; m < meshes.Count; m++)
+            {
+                Vertex[] vertices = meshes[m];
+                for (int i = 0; i < vertices.Length; i++)
+                {
+                    Vertex v = vertices[i];
+                    data[o++] = v.Position.X;  data[o++] = v.Position.Y;  data[o++] = v.Position.Z;
+                    data[o++] = v.Normal.X;    data[o++] = v.Normal.Y;    data[o++] = v.Normal.Z;
+                    data[o++] = v.Texture.X;   data[o++] = v.Texture.Y;
+                    data[o++] = v.Tangent.X;   data[o++] = v.Tangent.Y;   data[o++] = v.Tangent.Z;
+                    data[o++] = v.Bitangent.X; data[o++] = v.Bitangent.Y; data[o++] = v.Bitangent.Z;
+                }
+            }
+
+            vertexCount = totalVertices;
+            int dataBytes = floatCount * sizeof(float);
             GL.BindBuffer(BufferTarget.ArrayBuffer, modelVbo);
-            int dataBytes = data.Length * sizeof(float);
             if (dataBytes != modelBufferBytes)
             {
-                GL.BufferData(BufferTarget.ArrayBuffer, dataBytes, data, BufferUsageHint.DynamicDraw);
+                GL.BufferData(BufferTarget.ArrayBuffer, dataBytes, data, BufferUsageHint.StreamDraw);
                 modelBufferBytes = dataBytes;
             }
             else if (dataBytes > 0)
             {
+                // Orphan the old storage first so the driver need not wait for the GPU to finish with it.
+                GL.BufferData(BufferTarget.ArrayBuffer, dataBytes, IntPtr.Zero, BufferUsageHint.StreamDraw);
                 GL.BufferSubData(BufferTarget.ArrayBuffer, IntPtr.Zero, dataBytes, data);
             }
         }
 
+        private void UploadIndices()
+        {
+            IReadOnlyList<Vertex[]> meshes = MD5Model.MeshVertices;
+            IReadOnlyList<int[]> indices = MD5Model.MeshIndices;
+            int meshCount = MD5Model.MeshCount;
+
+            meshIndexOffsets = new int[meshCount];
+            meshIndexCounts = new int[meshCount];
+            meshIsEffect = new bool[meshCount];
+
+            int total = 0;
+            for (int m = 0; m < meshCount; m++) total += indices[m].Length;
+
+            uint[] combined = new uint[total];
+            int indexOffset = 0;
+            int vertexOffset = 0;
+            for (int m = 0; m < meshCount; m++)
+            {
+                int[] source = indices[m];
+                for (int i = 0; i < source.Length; i++)
+                {
+                    combined[indexOffset + i] = (uint)(source[i] + vertexOffset);
+                }
+
+                meshIndexOffsets[m] = indexOffset;
+                meshIndexCounts[m] = source.Length;
+                meshIsEffect[m] = IsEffectMaterial(MD5Model.GetMeshShader(m));
+                indexOffset += source.Length;
+                vertexOffset += meshes[m].Length;
+            }
+
+            indexCount = total;
+            GL.BindVertexArray(modelVao);
+            GL.BindBuffer(BufferTarget.ElementArrayBuffer, modelEbo);
+            GL.BufferData(BufferTarget.ElementArrayBuffer, total * sizeof(uint), combined, BufferUsageHint.StaticDraw);
+            GL.BindVertexArray(0);
+        }
+
         private void FrameModel()
         {
-            if (MD5Model == null)
+            if (MD5Model == null || !MD5Model.TryGetBounds(out Vector3 min, out Vector3 max))
             {
                 return;
-            }
-
-            Vertex[] vertices = MD5Model.GetCombinedVertices();
-            if (vertices.Length == 0)
-            {
-                return;
-            }
-
-            Vector3 min = vertices[0].Position;
-            Vector3 max = vertices[0].Position;
-            for (int i = 1; i < vertices.Length; i++)
-            {
-                min = Vector3.ComponentMin(min, vertices[i].Position);
-                max = Vector3.ComponentMax(max, vertices[i].Position);
             }
 
             modelCenter = (min + max) * 0.5f;
@@ -563,40 +635,57 @@ namespace MD5Viewer
         private void ResetCamera()
         {
             panOffset = Vector3.Zero;
-            rotx = -12f;
+            rotx = 15f;
             roty = 25f;
             cameraDistance = MathF.Max(30f, modelRadius / MathF.Sin(MathHelper.DegreesToRadians(22.5f)) * 1.18f);
         }
 
         private void SetCommonUniforms(Matrix4 model, Matrix4 view, Matrix4 projection)
         {
-            GL.UniformMatrix4(GL.GetUniformLocation(shaderProgram, "uModel"),      false, ref model);
-            GL.UniformMatrix4(GL.GetUniformLocation(shaderProgram, "uView"),       false, ref view);
-            GL.UniformMatrix4(GL.GetUniformLocation(shaderProgram, "uProjection"), false, ref projection);
-            GL.Uniform3(GL.GetUniformLocation(shaderProgram, "uLightPosition"), lightPosition);
-            GL.Uniform3(GL.GetUniformLocation(shaderProgram, "uCameraPos"),    cameraEye);
-            GL.Uniform1(GL.GetUniformLocation(shaderProgram, "uNormalYFlip"), normalYFlip ? 1 : 0);
+            // Normal matrix: inverse-transpose of the model matrix's upper 3x3, computed once on the CPU.
+            Matrix3 normalMatrix = Matrix3.Transpose(Matrix3.Invert(new Matrix3(model)));
+
+            // Fill light: opposite the key light horizontally, lower and dimmer.
+            Vector3 keyDirection = lightPosition - modelCenter;
+            Vector3 fillDirection = new Vector3(-keyDirection.X, -keyDirection.Y, keyDirection.Z * 0.5f);
+            fillDirection = fillDirection.LengthSquared > 1e-6f ? Vector3.Normalize(fillDirection) : Vector3.UnitZ;
+
+            GL.UniformMatrix4(uModelLoc, false, ref model);
+            GL.UniformMatrix4(uViewLoc, false, ref view);
+            GL.UniformMatrix4(uProjectionLoc, false, ref projection);
+            GL.UniformMatrix3(uNormalMatrixLoc, false, ref normalMatrix);
+            GL.Uniform3(uLightPositionLoc, lightPosition);
+            GL.Uniform3(uFillDirectionLoc, fillDirection);
+            GL.Uniform3(uCameraPosLoc, cameraEye);
+            GL.Uniform1(uNormalYFlipLoc, normalYFlip ? 1 : 0);
+        }
+
+        /// <summary>Unit vector from the orbit target to the camera.</summary>
+        private Vector3 OrbitDirection()
+        {
+            float yaw = MathHelper.DegreesToRadians(roty);
+            float pitch = MathHelper.DegreesToRadians(rotx);
+            return new Vector3(
+                MathF.Cos(pitch) * MathF.Cos(yaw),
+                MathF.Cos(pitch) * MathF.Sin(yaw),
+                MathF.Sin(pitch));
         }
 
         private Matrix4 BuildViewMatrix()
         {
-            float yaw   = MathHelper.DegreesToRadians(roty);
-            float pitch = MathHelper.DegreesToRadians(rotx);
-            Vector3 target    = modelCenter + panOffset;
-            Vector3 direction = new Vector3(
-                MathF.Cos(pitch) * MathF.Cos(yaw),
-                MathF.Cos(pitch) * MathF.Sin(yaw),
-                MathF.Sin(pitch));
-            cameraEye = target + direction * cameraDistance;
+            Vector3 target = modelCenter + panOffset;
+            cameraEye = target + OrbitDirection() * cameraDistance;
             return Matrix4.LookAt(cameraEye, target, Vector3.UnitZ);
         }
 
-        private static void ConfigureModelVertexArray(int vao, int vbo)
+        private static void ConfigureModelVertexArray(int vao, int vbo, int ebo)
         {
             GL.BindVertexArray(vao);
             GL.BindBuffer(BufferTarget.ArrayBuffer, vbo);
+            // The element buffer binding is part of the VAO state.
+            GL.BindBuffer(BufferTarget.ElementArrayBuffer, ebo);
 
-            int stride = 14 * sizeof(float);
+            int stride = FloatsPerVertex * sizeof(float);
             GL.EnableVertexAttribArray(0);
             GL.VertexAttribPointer(0, 3, VertexAttribPointerType.Float, false, stride, 0);
             GL.EnableVertexAttribArray(1);
@@ -621,6 +710,8 @@ namespace MD5Viewer
             GL.VertexAttribPointer(1, 3, VertexAttribPointerType.Float, false, stride, 3 * sizeof(float));
             GL.EnableVertexAttribArray(2);
             GL.VertexAttribPointer(2, 2, VertexAttribPointerType.Float, false, stride, 6 * sizeof(float));
+            // Attributes 3/4 (tangent frame) are unused by the grid; generic values are set
+            // explicitly because disabled attributes read the current generic attribute.
             GL.DisableVertexAttribArray(3);
             GL.VertexAttrib3(3, 1f, 0f, 0f);
             GL.DisableVertexAttribArray(4);
@@ -631,51 +722,61 @@ namespace MD5Viewer
         {
             if (Path.GetExtension(file).Equals(".tga", StringComparison.OrdinalIgnoreCase))
             {
-                return BuildTgaTexture(file, srgb);
+                TgaImage tga = TgaImage.Load(file);
+                return UploadTexture(tga.Width, tga.Height, PixelFormat.Rgba, tga.Rgba, srgb);
             }
 
+            // Rows stay top-down, exactly like the TGA loader produces them: MD5 texture
+            // coordinates use v = 0 for the top of the image, so no vertical flip is wanted.
             using Bitmap image = new Bitmap(file);
-            image.RotateFlip(RotateFlipType.RotateNoneFlipY);
-
             Rectangle rect = new Rectangle(0, 0, image.Width, image.Height);
             BitmapData bitmapdata = image.LockBits(rect, ImageLockMode.ReadOnly, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+            try
+            {
+                if (bitmapdata.Stride != image.Width * 4)
+                {
+                    throw new NotSupportedException($"Unexpected bitmap stride in '{file}'.");
+                }
+                return UploadTexture(image.Width, image.Height, PixelFormat.Bgra, bitmapdata.Scan0, srgb);
+            }
+            finally
+            {
+                image.UnlockBits(bitmapdata);
+            }
+        }
 
+        private static int UploadTexture<T>(int width, int height, PixelFormat format, T pixels, bool srgb)
+        {
             int texid = GL.GenTexture();
             GL.BindTexture(TextureTarget.Texture2D, texid);
             GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)TextureMagFilter.Linear);
             GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.LinearMipmapLinear);
             GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapS, (int)TextureWrapMode.Repeat);
             GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapT, (int)TextureWrapMode.Repeat);
-            GL.TexImage2D(TextureTarget.Texture2D, 0, srgb ? PixelInternalFormat.Srgb8Alpha8 : PixelInternalFormat.Rgba8, image.Width, image.Height, 0, PixelFormat.Bgra, PixelType.UnsignedByte, bitmapdata.Scan0);
-            GL.GenerateMipmap(GenerateMipmapTarget.Texture2D);
+            PixelInternalFormat internalFormat = srgb ? PixelInternalFormat.Srgb8Alpha8 : PixelInternalFormat.Rgba8;
 
-            image.UnlockBits(bitmapdata);
-            return texid;
-        }
+            switch (pixels)
+            {
+                case byte[] bytes:
+                    GL.TexImage2D(TextureTarget.Texture2D, 0, internalFormat, width, height, 0, format, PixelType.UnsignedByte, bytes);
+                    break;
+                case IntPtr pointer:
+                    GL.TexImage2D(TextureTarget.Texture2D, 0, internalFormat, width, height, 0, format, PixelType.UnsignedByte, pointer);
+                    break;
+                default:
+                    throw new ArgumentException("Unsupported pixel source.", nameof(pixels));
+            }
 
-        private static int BuildTgaTexture(string file, bool srgb)
-        {
-            TgaImage image = TgaImage.Load(file);
-            int texid = GL.GenTexture();
-            GL.BindTexture(TextureTarget.Texture2D, texid);
-            GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)TextureMagFilter.Linear);
-            GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.LinearMipmapLinear);
-            GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapS, (int)TextureWrapMode.Repeat);
-            GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapT, (int)TextureWrapMode.Repeat);
-            GL.TexImage2D(TextureTarget.Texture2D, 0, srgb ? PixelInternalFormat.Srgb8Alpha8 : PixelInternalFormat.Rgba8, image.Width, image.Height, 0, PixelFormat.Rgba, PixelType.UnsignedByte, image.Rgba);
             GL.GenerateMipmap(GenerateMipmapTarget.Texture2D);
             return texid;
         }
 
-        private static int BuildFlatNormalTexture()
-        {
-            return BuildSolidTexture(new byte[] { 128, 128, 255, 255 });
-        }
+        private static int BuildFlatNormalTexture() => BuildSolidTexture(new byte[] { 128, 128, 255, 255 });
 
-        private static int BuildWhiteTexture()
-        {
-            return BuildSolidTexture(new byte[] { 255, 255, 255, 255 });
-        }
+        private static int BuildWhiteTexture() => BuildSolidTexture(new byte[] { 255, 255, 255, 255 });
+
+        // A missing specular map means "no specular", not full-intensity specular.
+        private static int BuildBlackTexture() => BuildSolidTexture(new byte[] { 0, 0, 0, 255 });
 
         private static int BuildSolidTexture(byte[] rgba)
         {
@@ -683,7 +784,9 @@ namespace MD5Viewer
             GL.BindTexture(TextureTarget.Texture2D, texid);
             GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)TextureMagFilter.Nearest);
             GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.Nearest);
-            GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba, 1, 1, 0, PixelFormat.Rgba, PixelType.UnsignedByte, rgba);
+            GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapS, (int)TextureWrapMode.Repeat);
+            GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapT, (int)TextureWrapMode.Repeat);
+            GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba8, 1, 1, 0, PixelFormat.Rgba, PixelType.UnsignedByte, rgba);
             return texid;
         }
 
@@ -716,6 +819,8 @@ namespace MD5Viewer
                     throw new InvalidOperationException("OpenGL shader link failed: " + log);
                 }
 
+                GL.DetachShader(program, vertexShader);
+                GL.DetachShader(program, fragmentShader);
                 return program;
             }
             catch
@@ -790,6 +895,7 @@ namespace MD5Viewer
             layout (location = 4) in vec3 aBitangent;
 
             uniform mat4 uModel;
+            uniform mat3 uNormalMatrix;
             uniform mat4 uView;
             uniform mat4 uProjection;
 
@@ -801,12 +907,12 @@ namespace MD5Viewer
 
             void main()
             {
-                vec4 world    = uModel * vec4(aPosition, 1.0);
-                mat3 normalMat = mat3(transpose(inverse(uModel)));
+                vec4 world = uModel * vec4(aPosition, 1.0);
                 vWorldPos  = world.xyz;
-                vNormal    = normalize(normalMat * aNormal);
-                vTangent   = normalize(mat3(uModel) * aTangent);
-                vBitangent = normalize(mat3(uModel) * aBitangent);
+                // Normals use the inverse-transpose; tangents follow the surface, so they use the model matrix.
+                vNormal    = uNormalMatrix * aNormal;
+                vTangent   = mat3(uModel) * aTangent;
+                vBitangent = mat3(uModel) * aBitangent;
                 vTexCoord  = aTexCoord;
                 gl_Position = uProjection * uView * world;
             }
@@ -821,164 +927,136 @@ namespace MD5Viewer
             in vec3 vBitangent;
             in vec2 vTexCoord;
 
-            uniform sampler2D uDiffuseTexture;
-            uniform sampler2D uNormalTexture;
-            uniform sampler2D uSpecularTexture;
+            uniform sampler2D uDiffuseTexture;   // sRGB texture: sampled as linear
+            uniform sampler2D uNormalTexture;    // linear tangent-space normal map
+            uniform sampler2D uSpecularTexture;  // sRGB texture: sampled as linear
             uniform vec3      uLightPosition;
+            uniform vec3      uFillDirection;
             uniform vec3      uCameraPos;
             uniform int       uMode;
             uniform int       uNormalYFlip;
 
             out vec4 FragColor;
 
-            // Reconstruct a proper orthonormal TBN and return the world-space bump normal.
-            vec3 BumpNormal(vec3 N, vec3 rawTangentNormal)
+            const float GLOSS          = 32.0;
+            const float KEY_INTENSITY  = 1.0;
+            const float FILL_INTENSITY = 0.20;
+            const vec3  SKY_AMBIENT    = vec3(0.16, 0.17, 0.20);
+            const vec3  GROUND_AMBIENT = vec3(0.07, 0.06, 0.05);
+
+            // Exact sRGB transfer function (the default framebuffer is not sRGB-encoded).
+            vec3 LinearToSrgb(vec3 c)
             {
-                vec3 T = normalize(vTangent - N * dot(N, vTangent));
-                vec3 B = normalize(cross(N, T));
-                vec3 storedB = vBitangent;
-                // Ensure handedness matches the stored bitangent.
-                if (dot(B, storedB) < 0.0) B = -B;
-                return normalize(mat3(T, B, N) * rawTangentNormal);
+                c = clamp(c, 0.0, 1.0);
+                vec3 low  = c * 12.92;
+                vec3 high = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;
+                return mix(low, high, step(vec3(0.0031308), c));
             }
 
-            // Blinn-Phong specular (physically more correct highlight shape than Phong).
-            float Specular(vec3 N, vec3 L, vec3 V, float gloss)
+            // Orthonormal TBN (Gram-Schmidt) with handedness from the interpolated bitangent,
+            // so mirrored UV islands are lit correctly.
+            mat3 TangentFrame(vec3 N)
             {
-                if (dot(N, L) <= 0.0) return 0.0;
-                vec3 H = normalize(L + V);
-                return pow(max(dot(N, H), 0.0), gloss);
+                vec3 T = vTangent - N * dot(N, vTangent);
+                T = dot(T, T) > 1e-12 ? normalize(T) : normalize(cross(N, abs(N.z) < 0.9 ? vec3(0, 0, 1) : vec3(1, 0, 0)));
+                float handedness = dot(cross(N, T), vBitangent) < 0.0 ? -1.0 : 1.0;
+                return mat3(T, cross(N, T) * handedness, N);
             }
 
-            vec3 LinearToGamma(vec3 c) { return pow(clamp(c, 0.0, 1.0), vec3(1.0 / 2.2)); }
+            vec3 DecodeNormal(vec3 encoded)
+            {
+                vec3 n = encoded * 2.0 - 1.0;
+                if (uNormalYFlip == 1) n.y = -n.y;
+                return dot(n, n) > 1e-8 ? normalize(n) : vec3(0.0, 0.0, 1.0);
+            }
+
+            // Energy-normalised Blinn-Phong for a light of unit irradiance. Diffuse is
+            // albedo * N.L (the BRDF's 1/pi is folded into the light intensity). Doom 3
+            // specular maps encode absolute specular intensity, so no Fresnel term is added.
+            vec3 DirectLight(vec3 N, vec3 Ngeom, vec3 L, vec3 V, vec3 albedo, vec3 specColor, float intensity)
+            {
+                float NdotL = dot(N, L);
+                // A bumped normal must not receive light where the actual surface faces away from it.
+                float selfShadow = clamp(dot(Ngeom, L) * 4.0, 0.0, 1.0);
+                if (NdotL <= 0.0 || selfShadow <= 0.0) return vec3(0.0);
+
+                vec3  H      = normalize(L + V);
+                float NdotH  = max(dot(N, H), 0.0);
+                float normalization = (GLOSS + 8.0) / 8.0;
+                vec3  spec   = specColor * normalization * pow(NdotH, GLOSS);
+
+                return (albedo + spec) * NdotL * selfShadow * intensity;
+            }
+
+            vec3 Shade(vec3 N, vec3 Ngeom, vec3 V, vec3 albedo, vec3 specColor)
+            {
+                vec3 L = normalize(uLightPosition - vWorldPos);
+                vec3 color = DirectLight(N, Ngeom, L, V, albedo, specColor, KEY_INTENSITY);
+                color += albedo * max(dot(N, uFillDirection), 0.0) * FILL_INTENSITY;
+                // Hemispherical ambient (Z is up in Doom 3 space).
+                color += albedo * mix(GROUND_AMBIENT, SKY_AMBIENT, N.z * 0.5 + 0.5);
+                return color;
+            }
 
             void main()
             {
-                // --- geometry normals ---
-                vec3 N = normalize(vNormal);
+                if (uMode == 99) { FragColor = vec4(0.28, 0.30, 0.33, 1.0); return; }             // grid
+                if (uMode == 98) { FragColor = vec4(0.65, 0.16, 0.025, 0.42); return; }           // effect fallback
+                if (uMode == 1)  { FragColor = vec4(1.0, 0.85, 0.25, 1.0); return; }              // points
+                if (uMode == 2)  { FragColor = vec4(0.10, 0.85, 1.0, 1.0); return; }              // wireframe
 
-                // --- lighting vectors (all in world space) ---
-                vec3 L = normalize(uLightPosition - vWorldPos);
-                vec3 V = normalize(uCameraPos     - vWorldPos);   // correct: camera to fragment
+                vec3 Ngeom = normalize(vNormal);
+                // Back faces (visible only with culling disabled or flipped winding) need a flipped normal.
+                if (!gl_FrontFacing) Ngeom = -Ngeom;
 
-                // --- textures ---
-                vec3 diffuseLin   = texture(uDiffuseTexture,  vTexCoord).rgb;
-                vec3 normalSample = texture(uNormalTexture,   vTexCoord).rgb;
-                vec3 specMask     = texture(uSpecularTexture, vTexCoord).rgb;
+                vec3 V = normalize(uCameraPos - vWorldPos);
 
-                // Decode normal map.
-                vec3 tangentN;
-                tangentN.xy = (normalSample.xy * 2.0 - 1.0) * 1.15;  // slight boost for crispness
-                if (uNormalYFlip == 1)
-                {
-                    tangentN.y  = -tangentN.y;
-                }
-                tangentN.z  = normalSample.z * 2.0 - 1.0;
-                tangentN    = normalize(tangentN);
+                vec3 albedo    = texture(uDiffuseTexture,  vTexCoord).rgb;
+                vec3 specColor = texture(uSpecularTexture, vTexCoord).rgb;
+                mat3 TBN       = TangentFrame(Ngeom);
+                vec3 bumpN     = normalize(TBN * DecodeNormal(texture(uNormalTexture, vTexCoord).rgb));
 
-                // --- normals ---
-                vec3 bumpN = BumpNormal(N, tangentN);
-
-                // --- secondary lights ---
-                vec3 fillL = normalize(vec3(-L.x, -L.y, L.z) * vec3(1.0, 1.0, 0.5)); // wrap-around fill
-                vec3 rimL  = -L;                                                        // rim from opposite side
-
-                // ---------------------------------------------------------------
-                // FullRender (0): diffuse + normal map + specular, all assets used
-                // ---------------------------------------------------------------
-                if (uMode == 0)
+                vec3 color;
+                if (uMode == 0)       // FullRender: diffuse + normal map + specular
                 {
-                    float kD      = max(dot(bumpN, L),     0.0);
-                    float kFill   = max(dot(bumpN, fillL), 0.0) * 0.20;
-                    float kRim    = pow(1.0 - max(dot(bumpN, V), 0.0), 3.0) * 0.28;
-                    float kSpec   = Specular(bumpN, L, V, 64.0) * 0.85;
-                    float ambient = 0.15;  // lower = bump contrast more visible
-                    vec3 lit = diffuseLin * (ambient + kD * 1.10 + kFill + kRim) + specMask * kSpec;
-                    FragColor = vec4(LinearToGamma(lit), 1.0);
+                    color = LinearToSrgb(Shade(bumpN, Ngeom, V, albedo, specColor));
                 }
-                // ---------------------------------------------------------------
-                // Points (1) / Wireframe (2): flat colour overlays
-                // ---------------------------------------------------------------
-                else if (uMode == 1)
+                else if (uMode == 3)  // Texture: raw diffuse
                 {
-                    FragColor = vec4(1.0, 0.85, 0.25, 1.0);
+                    color = LinearToSrgb(albedo);
                 }
-                else if (uMode == 2)
+                else if (uMode == 4)  // Light: same shading with geometry normals only
                 {
-                    FragColor = vec4(0.10, 0.85, 1.0, 1.0);
+                    color = LinearToSrgb(Shade(Ngeom, Ngeom, V, albedo, specColor));
                 }
-                // ---------------------------------------------------------------
-                // Texture (3): raw diffuse
-                // ---------------------------------------------------------------
-                else if (uMode == 3)
+                else if (uMode == 5)  // NormalMap: world-space bumped normal
                 {
-                    FragColor = vec4(LinearToGamma(diffuseLin), 1.0);
+                    color = bumpN * 0.5 + 0.5;
                 }
-                // ---------------------------------------------------------------
-                // Light (4): full Blinn-Phong with geometry normals only (no bump)
-                // ---------------------------------------------------------------
-                else if (uMode == 4)
+                else if (uMode == 6)  // SpecularMap: raw specular texture
                 {
-                    float kD      = max(dot(N, L),     0.0);
-                    float kFill   = max(dot(N, fillL), 0.0) * 0.22;
-                    float kRim    = pow(1.0 - max(dot(N, V), 0.0), 3.0) * 0.18;
-                    float kSpec   = Specular(N, L, V, 96.0) * 0.70;
-                    float ambient = 0.30;
-                    vec3 lit = diffuseLin * (ambient + kD * 0.90 + kFill + kRim) + specMask * kSpec;
-                    FragColor = vec4(LinearToGamma(lit), 1.0);
+                    color = LinearToSrgb(specColor);
                 }
-                // ---------------------------------------------------------------
-                // NormalMap (5): show decoded world-space bump direction
-                // ---------------------------------------------------------------
-                else if (uMode == 5)
+                else if (uMode == 7)  // BumpMap: grazing-light relief diagnostic
                 {
-                    FragColor = vec4(bumpN * 0.5 + 0.5, 1.0);
+                    vec3  grazL  = normalize(vec3(-0.80, -0.20, 0.18));
+                    float baseD  = max(dot(Ngeom, grazL), 0.0);
+                    float bumpD  = max(dot(bumpN, grazL), 0.0);
+                    float relief = clamp((bumpD - baseD) * 3.2 + 0.5, 0.0, 1.0);
+                    color = LinearToSrgb(albedo * (0.15 + relief * 1.40));
                 }
-                // ---------------------------------------------------------------
-                // SpecularMap (6): raw specular texture
-                // ---------------------------------------------------------------
-                else if (uMode == 6)
+                else if (uMode == 8)  // DiagnosticTBN: tangent (R), bitangent (G), normal (B) facing the viewer
                 {
-                    FragColor = vec4(specMask, 1.0);
+                    color = vec3(abs(dot(TBN[0], V)), abs(dot(TBN[1], V)), abs(dot(TBN[2], V)));
+                    // Mirrored UV islands (left-handed frames) are shown darker.
+                    if (dot(cross(TBN[2], TBN[0]), TBN[1]) < 0.0) color *= 0.45;
                 }
-                // ---------------------------------------------------------------
-                // BumpMap (7): grazing diagnostic - shows relief / bump contrast
-                // ---------------------------------------------------------------
-                else if (uMode == 7)
-                {
-                    // Use a low-angle grazing light to make bump detail pop.
-                    vec3 grazL    = normalize(vec3(-0.80, -0.20, 0.18));
-                    float baseD   = max(dot(N,     grazL), 0.0);
-                    float bumpD   = max(dot(bumpN, grazL), 0.0);
-                    float relief  = clamp((bumpD - baseD) * 3.2 + 0.5, 0.0, 1.0);
-                    float kSpec   = Specular(bumpN, grazL, V, 48.0) * 1.20;
-                    vec3 lit      = diffuseLin * (0.15 + relief * 1.40) + specMask * kSpec;
-                    FragColor     = vec4(LinearToGamma(lit), 1.0);
-                }
-                // ---------------------------------------------------------------
-                // DiagnosticTBN (8): T=red, B=green, N=blue in world space
-                // ---------------------------------------------------------------
-                else if (uMode == 8)
-                {
-                    vec3 T  = normalize(vTangent);
-                    vec3 B  = normalize(vBitangent);
-                    vec3 Nw = normalize(vNormal);
-                    FragColor = vec4(abs(T) * 0.5 + vec3(abs(B.x), abs(B.y), abs(Nw.z)) * 0.5, 1.0);
-                }
-                // ---------------------------------------------------------------
-                // Missing Doom 3 effect material fallback (98)
-                // ---------------------------------------------------------------
-                else if (uMode == 98)
-                {
-                    FragColor = vec4(0.65, 0.16, 0.025, 0.42);
-                }
-                // ---------------------------------------------------------------
-                // Grid / fallback (99)
-                // ---------------------------------------------------------------
                 else
                 {
-                    FragColor = vec4(0.28, 0.30, 0.33, 1.0);
+                    color = vec3(1.0, 0.0, 1.0);
                 }
+
+                FragColor = vec4(color, 1.0);
             }
             """;
     }

@@ -17,121 +17,88 @@ namespace MD5Viewer
 
         private struct MD5Vertex
         {
-            /// <summary>
-            /// StartWeight (int) index
-            /// </summary>
+            /// <summary>Index of the first weight of this vertex.</summary>
             public int StartWeight;
-            
-            /// <summary>
-            /// <para>CountWeight (int) is the number of weights, starting from the StartWeight (int) index,</para>
-            /// <para>which are used to calculate the final vertex position</para>
-            /// </summary>
+
+            /// <summary>Number of consecutive weights (starting at StartWeight) that influence this vertex.</summary>
             public int CountWeight;
-            
-            /// <summary>
-            /// The texture coordinates (also called UV coords)
-            /// </summary>
+
+            /// <summary>Texture coordinates (Doom 3 convention: v = 0 is the top of the image).</summary>
             public Vector2 UV;
         }
 
         private struct MD5Weight
         {
-            /// <summary>
-            /// Joint is the joint it depends of
-            /// </summary>
+            /// <summary>Joint this weight is attached to.</summary>
             public int Joint;
 
-            /// <summary>
-            /// <para>Bias is a factor in the [0, 1] range which defines</para>
-            /// <para>the contribution of this weight when computing a vertex position</para>
-            /// </summary>
+            /// <summary>Contribution of this weight, in [0, 1]. The biases of one vertex sum to 1.</summary>
             public float Bias;
 
-            /// <summary>
-            /// The weight's position in space
-            /// </summary>
+            /// <summary>Weight position in the joint's local space.</summary>
             public Vector3 Pos;
+
+            // Bind-pose tangent frame expressed in the joint's local space, so it can be
+            // skinned with the same joint rotations as the position.
             public Vector3 Normal;
             public Vector3 Tangent;
             public Vector3 Bitangent;
         }
 
+        /// <summary>A joint in model (object) space.</summary>
         private struct MD5Joint
         {
-            /// <summary>
-            /// The joint's name (string)
-            /// </summary>
             public string Name;
-
-            /// <summary>
-            /// <para>The joint's parent index (int)</para>
-            /// <para>If it is equal to -1, then the joint has no parent joint and is what we call a root  joint</para>
-            /// </summary>
             public int Parent;
-
-            /// <summary>
-            /// The joint's position in space (float)
-            /// </summary>
             public Vector3 Pos;
+            public Quaternion Orient;
+        }
 
-            /// <summary>
-            /// The joint's orientation quaternion x, y and z components
-            /// </summary>
+        /// <summary>A joint relative to its parent (the space MD5 animation data is stored in).</summary>
+        private struct LocalJoint
+        {
+            public Vector3 Pos;
             public Quaternion Orient;
         }
 
         private struct MD5Mesh
         {
-            /// <summary>
-            /// <para>The shader string is defined in the MTR files (/materials  directory) of Doom 3 </para>
-            /// <para>and tell you what are the textures to apply to the mesh and how to combine them </para>
-            /// </summary>
+            /// <summary>Material name (defined in the Doom 3 .mtr files).</summary>
             public string Shader;
-
-            /// <summary>
-            /// The number of vertices of the mesh (int)
-            /// </summary>
             public int NumVert;
-
-            /// <summary>
-            /// The number of triangles of the mesh (int)
-            /// </summary>
             public int NumTris;
-
-
-            /// <summary>
-            /// The number of weights of the mesh (int)
-            /// </summary>
             public int NumWeights;
-
-
             public int[][] Faces;
             public MD5Vertex[] Verts;
             public MD5Weight[] Weights;
         }
 
-        private struct Animation
+        private sealed class Animation
         {
             public string AnimName;
-
-            //The number of frames of the animation
             public int NumFrames;
-
-            //The number of joints of the frame skeletons
             public int NumJoints;
-
-            //The number of frames per second to draw for the animation
             public int FrameRate;
 
+            /// <summary>Parent index per joint (from the animation hierarchy).</summary>
+            public int[] Parents;
 
-            public MD5Joint[,] SkelFrames;
+            /// <summary>Per-frame joints in parent-relative space: [frame, joint].</summary>
+            public LocalJoint[,] Frames;
             public MD5BoundingBox[] Boxes;
 
-            public int CurrentFrame;
-            public int NextFrame;
-            public float LastTime;
-            public float MaxTime;
+            /// <summary>Playback time in seconds, kept in [0, Duration).</summary>
+            public float Time;
 
+            /// <summary>
+            /// Number of frame-to-frame intervals in one cycle. Doom 3 exports looping
+            /// animations with the last frame equal to the first one, so a cycle covers
+            /// frames 0 .. NumFrames-1 and wraps without blending the last frame into frame 0
+            /// (see idMD5Anim::ConvertTimeToFrame).
+            /// </summary>
+            public int CycleFrames => Math.Max(1, NumFrames - 1);
+
+            public float Duration => (float)CycleFrames / FrameRate;
         }
 
         private struct MD5BoundingBox
@@ -148,187 +115,249 @@ namespace MD5Viewer
             public int StartIndex;
         }
 
-        private struct MD5BaseFrameJoint
-        {
-            public Vector3 Pos;
-            public Quaternion Orient;
-        }
-
-        //Version of the format
+        // Format version (Doom 3 uses 10)
         private int versionNr;
-        //The number of meshes of the model contained in the md5mesh file
         private int numMeshes;
-        //The number of joints of the model's skeleton
         private int numJoints;
 
-        private int meshIndex;
-
-        //The model's skeleton stored in the MD5 Mesh files is what we call the "bind-pose skeleton"
+        /// <summary>The skeleton stored in the .md5mesh file (bind pose), in model space.</summary>
         private MD5Joint[] bPSkeleton;
+
+        /// <summary>The current animated skeleton, in model space.</summary>
         private MD5Joint[] skeleton;
 
-        List<Animation> animations = new List<Animation>();
-        Animation curAnim;
-
+        private readonly List<Animation> animations = new List<Animation>();
+        private Animation curAnim;
 
         private MD5Mesh[] model;
-        private Vector3[] finalVertices;
-        private List<Vertex[]> meshes = new List<Vertex[]>();
-        private bool bindPoseBasisReady;
 
-        private bool animated = false;
+        // Skinned output. Vertex arrays are allocated once and overwritten every update;
+        // index arrays are static because the topology never changes.
+        private readonly List<Vertex[]> meshVertices = new List<Vertex[]>();
+        private readonly List<int[]> meshIndices = new List<int[]>();
 
-        public IReadOnlyList<Vertex[]> Meshes
-        {
-            get { return meshes; }
-        }
+        private bool animated;
 
-        public bool HasAnimation
-        {
-            get { return animated; }
-        }
+        /// <summary>Skinned vertices of each mesh (one entry per MD5 vertex).</summary>
+        public IReadOnlyList<Vertex[]> MeshVertices => meshVertices;
 
-        public int MeshCount => meshes.Count;
+        /// <summary>Triangle indices of each mesh, referencing <see cref="MeshVertices"/> (counter-clockwise front faces).</summary>
+        public IReadOnlyList<int[]> MeshIndices => meshIndices;
+
+        public bool HasAnimation => animated;
+
+        public int MeshCount => meshVertices.Count;
+
+        /// <summary>
+        /// When enabled (default), the translation of the root joint is held at its first-frame
+        /// value, so animations with root motion (e.g. walk cycles) play in place instead of
+        /// sliding away and snapping back at every loop. Doom 3 extracts this motion and
+        /// applies it to the entity instead of the mesh.
+        /// </summary>
+        public bool LockRootMotion { get; set; } = true;
 
         public string GetMeshShader(int index) =>
             (index >= 0 && index < numMeshes && model != null) ? model[index].Shader ?? "" : "";
-
 
         public void Load(string filename)
         {
             ArgumentException.ThrowIfNullOrWhiteSpace(filename);
 
             animations.Clear();
-            curAnim = default;
+            curAnim = null;
             animated = false;
-            bindPoseBasisReady = false;
-            meshes.Clear();
-            meshIndex = 0;
-            string line = "";
+            skeleton = null;
+            bPSkeleton = null;
+            model = null;
+            versionNr = numJoints = numMeshes = 0;
+            meshVertices.Clear();
+            meshIndices.Clear();
+
+            int meshIndex = 0;
+            int jointsRead = 0;
             TextBuffer buffer = new TextBuffer();
 
             using (StreamReader file = new StreamReader(filename))
             {
+                string line;
                 while ((line = file.ReadLine()) != null)
                 {
-                    // The first line tell you the version of the format. This is an integer. Doom 3's MD5 version is 10.
+                    CleanString(ref line);
+                    if (line.Length == 0) continue;
+
                     if (ParseLine(ref buffer, line, "MD5Version %i"))
                     {
                         versionNr = buffer.Ints[0];
+                        continue;
                     }
 
-                    // Read number of joints
                     if (ParseLine(ref buffer, line, "numJoints %i"))
                     {
                         numJoints = buffer.Ints[0];
+                        if (numJoints <= 0) throw new InvalidDataException($"Invalid joint count in '{filename}'.");
                         bPSkeleton = new MD5Joint[numJoints];
+                        continue;
                     }
 
-                    // Read number of meshes
                     if (ParseLine(ref buffer, line, "numMeshes %i"))
                     {
                         numMeshes = buffer.Ints[0];
+                        if (numMeshes <= 0) throw new InvalidDataException($"Invalid mesh count in '{filename}'.");
                         model = new MD5Mesh[numMeshes];
+                        continue;
                     }
 
-                    // Parse model joints
-                    if (line.Equals("joints {"))
+                    if (line == "joints {")
                     {
+                        if (bPSkeleton == null) throw new InvalidDataException($"'joints' block before 'numJoints' in '{filename}'.");
+
                         for (int i = 0; i < numJoints; i++)
                         {
                             line = ReadRequiredLine(file, "joint");
                             CleanString(ref line);
 
                             RequireParsed(ref buffer, line, "%s %i ( %f %f %f ) ( %f %f %f )", filename);
-                            bPSkeleton[i].Name = buffer.String;
-                            bPSkeleton[i].Parent = buffer.Ints[0];
-                            bPSkeleton[i].Pos.X = buffer.Floats[0];
-                            bPSkeleton[i].Pos.Y = buffer.Floats[1];
-                            bPSkeleton[i].Pos.Z = buffer.Floats[2];
-                            bPSkeleton[i].Orient = new Quaternion(buffer.Floats[3], buffer.Floats[4], buffer.Floats[5], 1);
+                            int parent = buffer.Ints[0];
+                            if (parent < -1 || parent >= i)
+                            {
+                                throw new InvalidDataException($"Joint {i} has invalid parent {parent} in '{filename}'.");
+                            }
 
-                            // After reading a joint, you must calculate the w component
+                            bPSkeleton[i].Name = buffer.String;
+                            bPSkeleton[i].Parent = parent;
+                            bPSkeleton[i].Pos = new Vector3(buffer.Floats[0], buffer.Floats[1], buffer.Floats[2]);
+                            bPSkeleton[i].Orient = new Quaternion(buffer.Floats[3], buffer.Floats[4], buffer.Floats[5], 1);
                             MyMath.ComputeWComponent(ref bPSkeleton[i].Orient);
                         }
+                        jointsRead = numJoints;
+                        continue;
                     }
 
-                    // Parse model meshes
-                    if (line.Equals("mesh {"))
+                    if (line == "mesh {")
                     {
-                        while (!line.Equals("}"))
+                        if (model == null || meshIndex >= numMeshes)
                         {
-                            line = ReadRequiredLine(file, "mesh");
-                            CleanString(ref line);
-
-                            // Read texture name
-                            if (line.StartsWith("shader"))
-                            {
-                                if (ParseLine(ref buffer, line, "shader %s"))
-                                {
-                                    model[meshIndex].Shader = buffer.String;
-                                }
-                            }
-
-                            // Read mesh data
-                            if (ParseLine(ref buffer, line, "numverts %i"))
-                            {
-                                model[meshIndex].NumVert = buffer.Ints[0];
-                                model[meshIndex].Verts = new MD5Vertex[model[meshIndex].NumVert];
-
-                                //model[meshCount].texture = Texture.Load(textureName, false);
-
-                                for (int i = 0; i < model[meshIndex].NumVert; i++)
-                                {
-                                    line = ReadRequiredLine(file, "vertex");
-                                    RequireParsed(ref buffer, line, "vert %i ( %f %f ) %i %i", filename);
-                                    model[meshIndex].Verts[buffer.Ints[0]].UV.X = buffer.Floats[0];
-                                    model[meshIndex].Verts[buffer.Ints[0]].UV.Y = buffer.Floats[1];
-                                    model[meshIndex].Verts[buffer.Ints[0]].StartWeight = buffer.Ints[1];
-                                    model[meshIndex].Verts[buffer.Ints[0]].CountWeight = buffer.Ints[2];
-                                }
-                            }
-                            if (ParseLine(ref buffer, line, "numtris %i"))
-                            {
-                                model[meshIndex].NumTris = buffer.Ints[0];
-                                model[meshIndex].Faces = new int[model[meshIndex].NumTris][];
-                                for (int i = 0; i < model[meshIndex].NumTris; i++)
-                                {
-                                    line = ReadRequiredLine(file, "triangle");
-                                    RequireParsed(ref buffer, line, "tri %i %i %i %i", filename);
-
-                                    model[meshIndex].Faces[buffer.Ints[0]] = new int[3];
-                                    model[meshIndex].Faces[buffer.Ints[0]][0] = buffer.Ints[3];
-                                    model[meshIndex].Faces[buffer.Ints[0]][1] = buffer.Ints[2];
-                                    model[meshIndex].Faces[buffer.Ints[0]][2] = buffer.Ints[1];
-                                }
-                            }
-                            if (ParseLine(ref buffer, line, "numweights %i"))
-                            {
-                                model[meshIndex].NumWeights = buffer.Ints[0];
-                                model[meshIndex].Weights = new MD5Weight[model[meshIndex].NumWeights];
-                                for (int i = 0; i < model[meshIndex].NumWeights; i++)
-                                {
-                                    line = ReadRequiredLine(file, "weight");
-                                    RequireParsed(ref buffer, line, "weight %i %i %f ( %f %f %f )", filename);
-                                    model[meshIndex].Weights[buffer.Ints[0]].Joint = buffer.Ints[1];
-                                    model[meshIndex].Weights[buffer.Ints[0]].Bias = buffer.Floats[0];
-                                    model[meshIndex].Weights[buffer.Ints[0]].Pos.X = buffer.Floats[1];
-                                    model[meshIndex].Weights[buffer.Ints[0]].Pos.Y = buffer.Floats[2];
-                                    model[meshIndex].Weights[buffer.Ints[0]].Pos.Z = buffer.Floats[3];
-                                }
-                            }
+                            throw new InvalidDataException($"More mesh blocks than declared by 'numMeshes' in '{filename}'.");
                         }
+
+                        ParseMeshBlock(file, ref model[meshIndex], ref buffer, filename);
                         meshIndex++;
                     }
                 }
             }
 
-            if (versionNr != 10 || numJoints <= 0 || numMeshes <= 0 || meshIndex != numMeshes)
+            if (versionNr != 10 || numJoints <= 0 || jointsRead != numJoints || numMeshes <= 0 || meshIndex != numMeshes)
             {
                 throw new InvalidDataException($"Invalid or unsupported MD5 mesh '{filename}'.");
             }
+
+            for (int k = 0; k < numMeshes; k++)
+            {
+                ValidateMesh(model[k], k, filename);
+            }
+
             InitializeBindPoseBasis();
+            BuildOutputBuffers();
+
+            skeleton = bPSkeleton;
             ComputingVertexPositions(bPSkeleton);
+        }
+
+        private void ParseMeshBlock(StreamReader file, ref MD5Mesh mesh, ref TextBuffer buffer, string filename)
+        {
+            while (true)
+            {
+                string line = ReadRequiredLine(file, "mesh");
+                CleanString(ref line);
+                if (line == "}") break;
+                if (line.Length == 0) continue;
+
+                if (line.StartsWith("shader", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Keep the original spelling of the material name (ParseLine lower-cases).
+                    mesh.Shader = line.Length > 6 ? line[6..].Trim() : "";
+                    continue;
+                }
+
+                if (ParseLine(ref buffer, line, "numverts %i"))
+                {
+                    mesh.NumVert = RequireCount(buffer.Ints[0], "numverts", filename);
+                    mesh.Verts = new MD5Vertex[mesh.NumVert];
+
+                    for (int i = 0; i < mesh.NumVert; i++)
+                    {
+                        line = ReadRequiredLine(file, "vertex");
+                        RequireParsed(ref buffer, line, "vert %i ( %f %f ) %i %i", filename);
+                        int index = RequireIndex(buffer.Ints[0], mesh.NumVert, "vert", filename);
+                        mesh.Verts[index].UV = new Vector2(buffer.Floats[0], buffer.Floats[1]);
+                        mesh.Verts[index].StartWeight = buffer.Ints[1];
+                        mesh.Verts[index].CountWeight = buffer.Ints[2];
+                    }
+                }
+                else if (ParseLine(ref buffer, line, "numtris %i"))
+                {
+                    mesh.NumTris = RequireCount(buffer.Ints[0], "numtris", filename);
+                    mesh.Faces = new int[mesh.NumTris][];
+                    for (int i = 0; i < mesh.NumTris; i++)
+                    {
+                        line = ReadRequiredLine(file, "triangle");
+                        RequireParsed(ref buffer, line, "tri %i %i %i %i", filename);
+                        int index = RequireIndex(buffer.Ints[0], mesh.NumTris, "tri", filename);
+
+                        // Doom 3 stores triangles clockwise; reverse to counter-clockwise for OpenGL.
+                        mesh.Faces[index] = new[] { buffer.Ints[3], buffer.Ints[2], buffer.Ints[1] };
+                    }
+                }
+                else if (ParseLine(ref buffer, line, "numweights %i"))
+                {
+                    mesh.NumWeights = RequireCount(buffer.Ints[0], "numweights", filename);
+                    mesh.Weights = new MD5Weight[mesh.NumWeights];
+                    for (int i = 0; i < mesh.NumWeights; i++)
+                    {
+                        line = ReadRequiredLine(file, "weight");
+                        RequireParsed(ref buffer, line, "weight %i %i %f ( %f %f %f )", filename);
+                        int index = RequireIndex(buffer.Ints[0], mesh.NumWeights, "weight", filename);
+                        mesh.Weights[index].Joint = buffer.Ints[1];
+                        mesh.Weights[index].Bias = buffer.Floats[0];
+                        mesh.Weights[index].Pos = new Vector3(buffer.Floats[1], buffer.Floats[2], buffer.Floats[3]);
+                    }
+                }
+            }
+        }
+
+        private void ValidateMesh(MD5Mesh mesh, int meshIndex, string filename)
+        {
+            if (mesh.Verts == null || mesh.Faces == null || mesh.Weights == null)
+            {
+                throw new InvalidDataException($"Mesh {meshIndex} is incomplete in '{filename}'.");
+            }
+
+            for (int i = 0; i < mesh.NumVert; i++)
+            {
+                MD5Vertex v = mesh.Verts[i];
+                if (v.CountWeight <= 0 || v.StartWeight < 0 || v.StartWeight + v.CountWeight > mesh.NumWeights)
+                {
+                    throw new InvalidDataException($"Mesh {meshIndex}, vertex {i} references invalid weights in '{filename}'.");
+                }
+            }
+
+            for (int i = 0; i < mesh.NumTris; i++)
+            {
+                int[] face = mesh.Faces[i];
+                if (face == null || face[0] < 0 || face[0] >= mesh.NumVert ||
+                    face[1] < 0 || face[1] >= mesh.NumVert || face[2] < 0 || face[2] >= mesh.NumVert)
+                {
+                    throw new InvalidDataException($"Mesh {meshIndex}, triangle {i} is missing or references invalid vertices in '{filename}'.");
+                }
+            }
+
+            for (int i = 0; i < mesh.NumWeights; i++)
+            {
+                if (mesh.Weights[i].Joint < 0 || mesh.Weights[i].Joint >= numJoints)
+                {
+                    throw new InvalidDataException($"Mesh {meshIndex}, weight {i} references invalid joint in '{filename}'.");
+                }
+            }
         }
 
         public void LoadAnim(string animName, string filename)
@@ -340,147 +369,141 @@ namespace MD5Viewer
                 throw new InvalidOperationException("Load a mesh before loading an animation.");
             }
 
-            Animation anim = new Animation();
+            Animation anim = new Animation { AnimName = animName };
             TextBuffer buffer = new TextBuffer();
 
             MD5JointInfo[] jointInfos = null;
-            MD5BaseFrameJoint[] baseFrame = null;
+            LocalJoint[] baseFrame = null;
             float[] animFrameData = null;
-
-            anim.AnimName = animName;
-            int numAnimatedComponents = 0;
-            int frameIndex;
+            bool[] framesRead = null;
+            int numAnimatedComponents = -1;
+            int version = 0;
 
             using (StreamReader file = new StreamReader(filename))
             {
-                string line = "";
+                string line;
                 while ((line = file.ReadLine()) != null)
                 {
-                    if (line == "") continue;
+                    CleanString(ref line);
+                    if (line.Length == 0) continue;
 
-                    //Read number of joints
+                    if (ParseLine(ref buffer, line, "MD5Version %i"))
+                    {
+                        version = buffer.Ints[0];
+                        continue;
+                    }
+
                     if (ParseLine(ref buffer, line, "numFrames %i"))
                     {
-                        //Allocate memory for skeleton frames and bounding boxes
                         anim.NumFrames = buffer.Ints[0];
-
-                        if (anim.NumFrames > 0)
-                        {
-                            anim.Boxes = new MD5BoundingBox[anim.NumFrames];
-                        }
+                        if (anim.NumFrames <= 0) throw new InvalidDataException($"Invalid frame count in '{filename}'.");
+                        anim.Boxes = new MD5BoundingBox[anim.NumFrames];
+                        framesRead = new bool[anim.NumFrames];
+                        continue;
                     }
 
                     if (ParseLine(ref buffer, line, "numJoints %i"))
                     {
-                        //Allocate memory for joints of each frame
                         anim.NumJoints = buffer.Ints[0];
-
-                        if (anim.NumJoints > 0)
+                        if (anim.NumJoints != numJoints)
                         {
-                            //Allocate temporary memory for building skeleton frames
-                            jointInfos = new MD5JointInfo[anim.NumJoints];
-                            baseFrame = new MD5BaseFrameJoint[anim.NumJoints];
+                            throw new InvalidDataException($"Animation '{filename}' has {anim.NumJoints} joints, the mesh has {numJoints}.");
                         }
-                        anim.SkelFrames = new MD5Joint[anim.NumFrames, anim.NumJoints];
+                        jointInfos = new MD5JointInfo[anim.NumJoints];
+                        baseFrame = new LocalJoint[anim.NumJoints];
+                        anim.Parents = new int[anim.NumJoints];
+                        continue;
                     }
 
                     if (ParseLine(ref buffer, line, "frameRate %i"))
                     {
                         anim.FrameRate = buffer.Ints[0];
+                        continue;
                     }
 
-                    //numAnimatedComponents (int) is the number of parameters per frame used to compute the frame skeletons.
-                    //These parameters, combined with the baseframe skeleton given in the MD5 Anim file, permit to build a skeleton for each frame.
-
-                  
-
+                    // Number of animated float parameters per frame. Zero is valid (a static pose).
                     if (ParseLine(ref buffer, line, "numAnimatedComponents %i"))
                     {
                         numAnimatedComponents = buffer.Ints[0];
-
-                        //Allocate memory for animation frame data (zero-length is valid: a pure pose with no animated joints)
+                        if (numAnimatedComponents < 0) throw new InvalidDataException($"Invalid component count in '{filename}'.");
                         animFrameData = new float[numAnimatedComponents];
+                        continue;
                     }
 
-                    //After reading the header, comes the skeleton hierarchy.
-                    //It brings information about the joints for building the skeleton frames from the baseframe data.
-                    if (line.Equals("hierarchy {"))
+                    if (line == "hierarchy {")
                     {
+                        RequireHeader(jointInfos != null && numAnimatedComponents >= 0, "hierarchy", filename);
                         for (int i = 0; i < anim.NumJoints; ++i)
                         {
-                            //Read whole line
                             line = ReadRequiredLine(file, "animation hierarchy");
                             CleanString(ref line);
-
-                            //Read joint info
                             RequireParsed(ref buffer, line, "%s %i %i %i", filename);
-                            jointInfos[i].Name = buffer.String;
-                            jointInfos[i].Parent = buffer.Ints[0];
-                            jointInfos[i].Flags = buffer.Ints[1];
-                            jointInfos[i].StartIndex = buffer.Ints[2];
+
+                            MD5JointInfo info = new MD5JointInfo
+                            {
+                                Name = buffer.String,
+                                Parent = buffer.Ints[0],
+                                Flags = buffer.Ints[1],
+                                StartIndex = buffer.Ints[2]
+                            };
+
+                            if (info.Parent != bPSkeleton[i].Parent)
+                            {
+                                throw new InvalidDataException($"Animation '{filename}' joint {i} ('{info.Name}') does not match the mesh hierarchy.");
+                            }
+
+                            int componentCount = System.Numerics.BitOperations.PopCount((uint)(info.Flags & 63));
+                            if (componentCount > 0 && (info.StartIndex < 0 || info.StartIndex + componentCount > numAnimatedComponents))
+                            {
+                                throw new InvalidDataException($"Animation '{filename}' joint {i} references components outside the frame data.");
+                            }
+
+                            jointInfos[i] = info;
+                            anim.Parents[i] = info.Parent;
                         }
+                        continue;
                     }
 
-                    //After the hierarchy comes the frame bounds. There is a bounding box for each frame.
-                    if (line.Equals("bounds {"))
+                    if (line == "bounds {")
                     {
+                        RequireHeader(anim.Boxes != null, "bounds", filename);
                         for (int i = 0; i < anim.NumFrames; ++i)
                         {
-                            //Read whole line
                             line = ReadRequiredLine(file, "animation bounds");
                             CleanString(ref line);
-
-                            //Read bounding box
                             RequireParsed(ref buffer, line, "( %f %f %f ) ( %f %f %f )", filename);
-                            anim.Boxes[i].Min.X = buffer.Floats[0];
-                            anim.Boxes[i].Min.Y = buffer.Floats[1];
-                            anim.Boxes[i].Min.Z = buffer.Floats[2];
-                            anim.Boxes[i].Max.X = buffer.Floats[3];
-                            anim.Boxes[i].Max.Y = buffer.Floats[4];
-                            anim.Boxes[i].Max.Z = buffer.Floats[5];
+                            anim.Boxes[i].Min = new Vector3(buffer.Floats[0], buffer.Floats[1], buffer.Floats[2]);
+                            anim.Boxes[i].Max = new Vector3(buffer.Floats[3], buffer.Floats[4], buffer.Floats[5]);
                         }
+                        continue;
                     }
 
-                    //After bounds you'll find the baseframe data.
-                    //It contains the position and orientation of each joint from which the frame skeletons will be built.
-                    if (line.Equals("baseframe {"))
+                    // The baseframe holds the parent-relative joints that the per-frame
+                    // components are applied on top of.
+                    if (line == "baseframe {")
                     {
+                        RequireHeader(baseFrame != null, "baseframe", filename);
                         for (int i = 0; i < anim.NumJoints; ++i)
                         {
-                            //Read whole line
                             line = ReadRequiredLine(file, "animation base frame");
                             CleanString(ref line);
-
-                            //Read base frame joint
                             RequireParsed(ref buffer, line, "( %f %f %f ) ( %f %f %f )", filename);
 
-                            if (buffer.Floats.Length == 6)
-                            {
-                                baseFrame[i].Pos.X = buffer.Floats[0];
-                                baseFrame[i].Pos.Y = buffer.Floats[1];
-                                baseFrame[i].Pos.Z = buffer.Floats[2];
-                                baseFrame[i].Orient.X = buffer.Floats[3];
-                                baseFrame[i].Orient.Y = buffer.Floats[4];
-                                baseFrame[i].Orient.Z = buffer.Floats[5];
-
-                                //Compute the w component
-                                MyMath.ComputeWComponent(ref baseFrame[i].Orient);
-                            }
+                            baseFrame[i].Pos = new Vector3(buffer.Floats[0], buffer.Floats[1], buffer.Floats[2]);
+                            baseFrame[i].Orient = new Quaternion(buffer.Floats[3], buffer.Floats[4], buffer.Floats[5], 1);
+                            MyMath.ComputeWComponent(ref baseFrame[i].Orient);
                         }
+                        continue;
                     }
 
-                    //After the baseframe data, the frame data. There is a chunk of data for each frame.
-                    //This data are the parameters used to compute the frame's skeleton.
-                  
-                    //frameIndex (int) is the index of the frame
-
-                    
                     if (ParseLine(ref buffer, line, "frame %i {"))
                     {
-                        frameIndex = buffer.Ints[0];
+                        RequireHeader(jointInfos != null && baseFrame != null && animFrameData != null && framesRead != null, "frame", filename);
+                        anim.Frames ??= new LocalJoint[anim.NumFrames, anim.NumJoints];
 
-                        //Read frame data
-                        for (int i = 0; i < numAnimatedComponents; )
+                        int frameIndex = RequireIndex(buffer.Ints[0], anim.NumFrames, "frame", filename);
+
+                        for (int i = 0; i < numAnimatedComponents;)
                         {
                             line = ReadRequiredLine(file, $"animation frame {frameIndex}");
                             CleanString(ref line);
@@ -490,7 +513,6 @@ namespace MD5Viewer
                             }
 
                             string[] splt = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-
                             for (int ww = 0; ww < splt.Length; ww++)
                             {
                                 if (i >= numAnimatedComponents ||
@@ -502,181 +524,151 @@ namespace MD5Viewer
                             }
                         }
 
-                        //Build frame skeleton from the collected data
-                        BuildFrameSkeleton(ref jointInfos, ref baseFrame, ref animFrameData, frameIndex, anim.NumJoints, ref anim);
+                        BuildLocalFrame(jointInfos, baseFrame, animFrameData, frameIndex, anim);
+                        framesRead[frameIndex] = true;
                     }
                 }
-
-                if (anim.NumFrames <= 0 || anim.NumJoints != numJoints || anim.FrameRate <= 0 ||
-                    anim.SkelFrames == null || jointInfos == null || baseFrame == null || animFrameData == null)
-                {
-                    throw new InvalidDataException($"Invalid or incompatible MD5 animation '{filename}'.");
-                }
-                anim.CurrentFrame = 0;
-                anim.NextFrame = anim.NumFrames > 1 ? 1 : 0;
-
-                anim.LastTime = 0;
-                anim.MaxTime = 1.0f / anim.FrameRate;
-
-                /* Allocate memory for animated skeleton */
-                skeleton = new MD5Joint[anim.NumJoints];
-
-                animated = true;
-
-                animations.RemoveAll(item => item.AnimName == animName);
-                animations.Add(anim);
-                UseAnimation(animName);
-                Update(0);
             }
+
+            if (version != 10 || anim.NumFrames <= 0 || anim.NumJoints != numJoints || anim.FrameRate <= 0 ||
+                anim.Frames == null || anim.Parents == null || framesRead == null || Array.IndexOf(framesRead, false) >= 0)
+            {
+                throw new InvalidDataException($"Invalid or incompatible MD5 animation '{filename}'.");
+            }
+
+            if (LockRootMotion)
+            {
+                RemoveRootMotion(anim);
+            }
+
+            anim.Time = 0f;
+            skeleton = new MD5Joint[numJoints];
+            for (int i = 0; i < numJoints; i++)
+            {
+                skeleton[i].Name = bPSkeleton[i].Name;
+                skeleton[i].Parent = bPSkeleton[i].Parent;
+            }
+
+            animations.RemoveAll(item => item.AnimName == animName);
+            animations.Add(anim);
+            animated = true;
+            UseAnimation(animName);
         }
 
-
-        private void BuildFrameSkeleton(ref MD5JointInfo[] jointInfos, ref MD5BaseFrameJoint[] baseFrame, ref float[] animFrameData, int frameIndex, int num_joints, ref Animation md5anim)
+        /// <summary>
+        /// Applies the animated components of one frame to the base frame, producing
+        /// parent-relative joints. Hierarchy concatenation is deferred until after blending.
+        /// </summary>
+        private static void BuildLocalFrame(MD5JointInfo[] jointInfos, LocalJoint[] baseFrame, float[] frameData, int frameIndex, Animation anim)
         {
-            for (int i = 0; i < num_joints; ++i)
+            for (int i = 0; i < anim.NumJoints; ++i)
             {
-                int j = 0;
-                MD5BaseFrameJoint baseJoint = baseFrame[i];
-                Vector3 animatedPos;
-                Quaternion animatedOrient;
+                MD5JointInfo info = jointInfos[i];
+                Vector3 pos = baseFrame[i].Pos;
+                Quaternion orient = baseFrame[i].Orient;
+                int j = info.StartIndex;
 
-                animatedPos = baseJoint.Pos;
-                animatedOrient = baseJoint.Orient;
+                if ((info.Flags & 1) != 0) pos.X = frameData[j++];     // Tx
+                if ((info.Flags & 2) != 0) pos.Y = frameData[j++];     // Ty
+                if ((info.Flags & 4) != 0) pos.Z = frameData[j++];     // Tz
+                if ((info.Flags & 8) != 0) orient.X = frameData[j++];  // Qx
+                if ((info.Flags & 16) != 0) orient.Y = frameData[j++]; // Qy
+                if ((info.Flags & 32) != 0) orient.Z = frameData[j++]; // Qz
 
-                if ((jointInfos[i].Flags & 1) > 0) /* Tx */
-                {
-                    animatedPos.X = animFrameData[jointInfos[i].StartIndex + j];
-                    ++j;
-                }
+                MyMath.ComputeWComponent(ref orient);
 
-                if ((jointInfos[i].Flags & 2) > 0) /* Ty */
-                {
-                    animatedPos.Y = animFrameData[jointInfos[i].StartIndex + j];
-                    ++j;
-                }
-
-                if ((jointInfos[i].Flags & 4) > 0) /* Tz */
-                {
-                    animatedPos.Z = animFrameData[jointInfos[i].StartIndex + j];
-                    ++j;
-                }
-
-                if ((jointInfos[i].Flags & 8) > 0) /* Qx */
-                {
-                    animatedOrient.X = animFrameData[jointInfos[i].StartIndex + j];
-                    ++j;
-                }
-
-                if ((jointInfos[i].Flags & 16) > 0) /* Qy */
-                {
-                    animatedOrient.Y = animFrameData[jointInfos[i].StartIndex + j];
-                    ++j;
-                }
-
-                if ((jointInfos[i].Flags & 32) > 0) /* Qz */
-                {
-                    animatedOrient.Z = animFrameData[jointInfos[i].StartIndex + j];
-                    ++j;
-                }
-
-                //Compute orient quaternion's w value
-                MyMath.ComputeWComponent(ref animatedOrient);
-
-                int parent = jointInfos[i].Parent;
-                md5anim.SkelFrames[frameIndex, i].Parent = parent;
-                md5anim.SkelFrames[frameIndex, i].Name = jointInfos[i].Name;
-
-                //Has parent?
-                if (md5anim.SkelFrames[frameIndex, i].Parent < 0)
-                {
-                    md5anim.SkelFrames[frameIndex, i].Pos = animatedPos;
-                    md5anim.SkelFrames[frameIndex, i].Orient = animatedOrient;
-                }
-                else
-                {
-                    MD5Joint parentJoint = md5anim.SkelFrames[frameIndex, parent];
-
-                    //Rotated Position
-                    Vector3 rpos;
-
-                    //Add positions
-                    rpos = MyMath.RotatePoint(ref parentJoint.Orient, ref animatedPos);
-
-                    md5anim.SkelFrames[frameIndex, i].Pos.X = rpos.X + parentJoint.Pos.X;
-                    md5anim.SkelFrames[frameIndex, i].Pos.Y = rpos.Y + parentJoint.Pos.Y;
-                    md5anim.SkelFrames[frameIndex, i].Pos.Z = rpos.Z + parentJoint.Pos.Z;
-
-                    //Concatenate rotations
-                    md5anim.SkelFrames[frameIndex, i].Orient = MyMath.Mult(ref parentJoint.Orient, ref animatedOrient);
-                    md5anim.SkelFrames[frameIndex, i].Orient = MyMath.Normalize(ref md5anim.SkelFrames[frameIndex, i].Orient);
-                }
-
-                MD5Joint builtJoint = md5anim.SkelFrames[frameIndex, i];
-                if (!float.IsFinite(builtJoint.Pos.X) ||
-                    !float.IsFinite(builtJoint.Pos.Y) ||
-                    !float.IsFinite(builtJoint.Pos.Z) ||
-                    !float.IsFinite(builtJoint.Orient.X) ||
-                    !float.IsFinite(builtJoint.Orient.Y) ||
-                    !float.IsFinite(builtJoint.Orient.Z) ||
-                    !float.IsFinite(builtJoint.Orient.W))
+                if (!float.IsFinite(pos.X) || !float.IsFinite(pos.Y) || !float.IsFinite(pos.Z) ||
+                    !float.IsFinite(orient.X) || !float.IsFinite(orient.Y) || !float.IsFinite(orient.Z) || !float.IsFinite(orient.W))
                 {
                     throw new InvalidDataException($"Animation produced an invalid joint at frame {frameIndex}, joint {i}.");
                 }
+
+                anim.Frames[frameIndex, i] = new LocalJoint { Pos = pos, Orient = orient };
             }
         }
 
-        private void InterpolateSkeletons(ref MD5Joint[,] skel, int curFrame, int nextFrame, int num_joints, float interp)
+        private static void RemoveRootMotion(Animation anim)
         {
-            for (int i = 0; i < num_joints; ++i)
+            for (int joint = 0; joint < anim.NumJoints; joint++)
             {
-                //Copy parent index
-                skeleton[i].Parent = skel[curFrame, i].Parent;
+                if (anim.Parents[joint] >= 0) continue;
 
-                //Linear interpolation for position
-                skeleton[i].Pos.X = skel[curFrame, i].Pos.X + interp * (skel[nextFrame, i].Pos.X - skel[curFrame, i].Pos.X);
-                skeleton[i].Pos.Y = skel[curFrame, i].Pos.Y + interp * (skel[nextFrame, i].Pos.Y - skel[curFrame, i].Pos.Y);
-                skeleton[i].Pos.Z = skel[curFrame, i].Pos.Z + interp * (skel[nextFrame, i].Pos.Z - skel[curFrame, i].Pos.Z);
-
-                //Spherical linear interpolation for orientation
-                skeleton[i].Orient = MyMath.Slerp(ref skel[curFrame, i].Orient, ref skel[nextFrame, i].Orient, interp);
+                Vector3 reference = anim.Frames[0, joint].Pos;
+                for (int frame = 1; frame < anim.NumFrames; frame++)
+                {
+                    anim.Frames[frame, joint].Pos = reference;
+                }
             }
         }
 
-        private void Animate(ref Animation anim, float dt)
+        /// <summary>
+        /// Blends two frames in parent-relative space (lerp translation, slerp rotation) and
+        /// then concatenates the hierarchy into model space, as Doom 3 does. Blending
+        /// model-space joints instead would shorten limbs during fast rotations.
+        /// </summary>
+        private void BlendSkeleton(Animation anim, int frame1, int frame2, float blend)
         {
-            if (!float.IsFinite(dt) || dt <= 0f)
+            for (int i = 0; i < anim.NumJoints; ++i)
             {
+                LocalJoint a = anim.Frames[frame1, i];
+                LocalJoint b = anim.Frames[frame2, i];
+
+                Vector3 pos = Vector3.Lerp(a.Pos, b.Pos, blend);
+                Quaternion orient = MyMath.Slerp(ref a.Orient, ref b.Orient, blend);
+
+                int parent = anim.Parents[i];
+                if (parent < 0)
+                {
+                    skeleton[i].Pos = pos;
+                    skeleton[i].Orient = orient;
+                }
+                else
+                {
+                    MD5Joint p = skeleton[parent];
+                    skeleton[i].Pos = p.Pos + MyMath.RotatePoint(ref p.Orient, ref pos);
+                    Quaternion combined = MyMath.Mult(ref p.Orient, ref orient);
+                    skeleton[i].Orient = MyMath.Normalize(ref combined);
+                }
+            }
+        }
+
+        private static void TimeToFrames(Animation anim, out int frame1, out int frame2, out float blend)
+        {
+            if (anim.NumFrames <= 1)
+            {
+                frame1 = frame2 = 0;
+                blend = 0f;
                 return;
             }
 
-            anim.LastTime += dt;
-            int maxFrames = anim.NumFrames - 1;
-
-            //Move to next frame
-            while (anim.LastTime >= anim.MaxTime)
-            {
-                anim.NextFrame++;
-                anim.CurrentFrame++;
-                anim.LastTime -= anim.MaxTime;
-
-                if (anim.CurrentFrame > maxFrames) anim.CurrentFrame = 0;
-                if (anim.NextFrame > maxFrames) anim.NextFrame = 0;
-            }
+            double frameTime = (double)anim.Time * anim.FrameRate;
+            int whole = (int)Math.Floor(frameTime);
+            blend = (float)(frameTime - whole);
+            frame1 = whole % anim.CycleFrames;
+            if (frame1 < 0) frame1 += anim.CycleFrames;
+            frame2 = frame1 + 1;
         }
 
-        public void Update(float time)
+        public void Update(float dt)
         {
-            if (animated)
+            if (animated && curAnim != null)
             {
-                //Calculate current and next frames
-                Animate(ref curAnim, time);
-                // Interpolate skeletons between two frames.
-                InterpolateSkeletons(ref curAnim.SkelFrames, curAnim.CurrentFrame, curAnim.NextFrame, curAnim.NumJoints, curAnim.LastTime * curAnim.FrameRate);
+                if (float.IsFinite(dt) && dt > 0f)
+                {
+                    float duration = curAnim.Duration;
+                    curAnim.Time += dt;
+                    if (curAnim.Time >= duration)
+                    {
+                        curAnim.Time %= duration;
+                    }
+                }
+
+                TimeToFrames(curAnim, out int frame1, out int frame2, out float blend);
+                BlendSkeleton(curAnim, frame1, frame2, blend);
                 ComputingVertexPositions(skeleton);
             }
-            else
+            else if (bPSkeleton != null)
             {
-                //No animation, use bind-pose skeleton */
                 skeleton = bPSkeleton;
                 ComputingVertexPositions(skeleton);
             }
@@ -684,116 +676,107 @@ namespace MD5Viewer
 
         public void UseAnimation(string animName)
         {
-            if (curAnim.AnimName != animName)
+            Animation found = animations.Find(a => a.AnimName == animName);
+            if (found == null) return;
+
+            curAnim = found;
+            Update(0f);
+        }
+
+        public int CurrentFrame
+        {
+            get
             {
-                for (int q = 0; q < animations.Count; q++)
-                {
-                    if (animations[q].AnimName == animName)
-                    {
-                        curAnim = animations[q];
-                        break;
-                    }
-                }
+                if (!animated || curAnim == null) return 0;
+                TimeToFrames(curAnim, out int frame1, out _, out _);
+                return frame1;
             }
         }
 
-
-        public int CurrentFrame => animated ? curAnim.CurrentFrame : 0;
-        public int TotalFrames  => animated ? curAnim.NumFrames    : 0;
+        /// <summary>Number of distinct frames in one playback cycle.</summary>
+        public int TotalFrames => animated && curAnim != null ? curAnim.CycleFrames : 0;
 
         public void SeekToFrame(int frame)
         {
-            if (!animated) return;
-            int clamped = Math.Max(0, Math.Min(frame, curAnim.NumFrames - 1));
-            curAnim.CurrentFrame = clamped;
-            curAnim.NextFrame    = (clamped + 1) % curAnim.NumFrames;
-            curAnim.LastTime     = 0f;
-            InterpolateSkeletons(ref curAnim.SkelFrames, curAnim.CurrentFrame, curAnim.NextFrame, curAnim.NumJoints, 0f);
-            ComputingVertexPositions(skeleton);
+            if (!animated || curAnim == null) return;
+            int clamped = Math.Clamp(frame, 0, curAnim.CycleFrames - 1);
+            curAnim.Time = (float)clamped / curAnim.FrameRate;
+            Update(0f);
         }
 
-        private void ComputingVertexPositions(MD5Joint[] skeleton)
+        private void BuildOutputBuffers()
         {
-            meshes.Clear();
-
-            //Calculate the final Position ingame Position of all the model vertexes
+            meshVertices.Clear();
+            meshIndices.Clear();
             for (int k = 0; k < numMeshes; k++)
             {
-                finalVertices = new Vector3[model[k].NumVert];
-                Vector3[] skinnedNormals = new Vector3[model[k].NumVert];
-                Vector3[] skinnedTangents = new Vector3[model[k].NumVert];
-                Vector3[] skinnedBitangents = new Vector3[model[k].NumVert];
-                Vertex[] vertices = new Vertex[model[k].NumTris * 3];
+                MD5Mesh mesh = model[k];
+                meshVertices.Add(new Vertex[mesh.NumVert]);
 
-                //Setup vertices 
-                for (int i = 0; i < model[k].NumVert; i++)
+                int[] indices = new int[mesh.NumTris * 3];
+                for (int i = 0; i < mesh.NumTris; i++)
                 {
-                    //Calculate final vertex to draw with weights
-                    Vector3 finalVertex = new Vector3(0, 0, 0);
-                    Vector3 finalNormal = Vector3.Zero;
-                    Vector3 finalTangent = Vector3.Zero;
-                    Vector3 finalBitangent = Vector3.Zero;
-                    for (int j = 0; j < model[k].Verts[i].CountWeight; j++)
+                    indices[i * 3 + 0] = mesh.Faces[i][0];
+                    indices[i * 3 + 1] = mesh.Faces[i][1];
+                    indices[i * 3 + 2] = mesh.Faces[i][2];
+                }
+                meshIndices.Add(indices);
+            }
+        }
+
+        /// <summary>
+        /// CPU linear-blend skinning: every weight's position and bind-pose tangent frame is
+        /// transformed by its joint and accumulated with the weight's bias.
+        /// </summary>
+        private void ComputingVertexPositions(MD5Joint[] pose)
+        {
+            for (int k = 0; k < numMeshes; k++)
+            {
+                MD5Mesh mesh = model[k];
+                Vertex[] output = meshVertices[k];
+
+                for (int i = 0; i < mesh.NumVert; i++)
+                {
+                    Vector3 position = Vector3.Zero;
+                    Vector3 normal = Vector3.Zero;
+                    Vector3 tangent = Vector3.Zero;
+                    Vector3 bitangent = Vector3.Zero;
+
+                    MD5Vertex vert = mesh.Verts[i];
+                    for (int j = 0; j < vert.CountWeight; j++)
                     {
-                        MD5Weight weight = model[k].Weights[model[k].Verts[i].StartWeight + j];
-                        MD5Joint joint = skeleton[weight.Joint];
+                        MD5Weight weight = mesh.Weights[vert.StartWeight + j];
+                        MD5Joint joint = pose[weight.Joint];
 
-                        //Calculate transformed vertex for this weight
-                        Vector3 wv = MyMath.RotatePoint(ref joint.Orient, ref weight.Pos);
-
-                        //The sum of all weight->bias should be 1.0
-                        finalVertex.X += (joint.Pos.X + wv.X) * weight.Bias;
-                        finalVertex.Y += (joint.Pos.Y + wv.Y) * weight.Bias;
-                        finalVertex.Z += (joint.Pos.Z + wv.Z) * weight.Bias;
-
-                        if (bindPoseBasisReady)
-                        {
-                            Vector3 localNormal = weight.Normal;
-                            Vector3 localTangent = weight.Tangent;
-                            Vector3 localBitangent = weight.Bitangent;
-                            finalNormal += MyMath.RotatePoint(ref joint.Orient, ref localNormal) * weight.Bias;
-                            finalTangent += MyMath.RotatePoint(ref joint.Orient, ref localTangent) * weight.Bias;
-                            finalBitangent += MyMath.RotatePoint(ref joint.Orient, ref localBitangent) * weight.Bias;
-                        }
+                        position += (joint.Pos + MyMath.RotatePoint(ref joint.Orient, ref weight.Pos)) * weight.Bias;
+                        normal += MyMath.RotatePoint(ref joint.Orient, ref weight.Normal) * weight.Bias;
+                        tangent += MyMath.RotatePoint(ref joint.Orient, ref weight.Tangent) * weight.Bias;
+                        bitangent += MyMath.RotatePoint(ref joint.Orient, ref weight.Bitangent) * weight.Bias;
                     }
-                    finalVertices[i] = finalVertex;
 
-                    if (!float.IsFinite(finalVertex.X) ||
-                        !float.IsFinite(finalVertex.Y) ||
-                        !float.IsFinite(finalVertex.Z))
+                    if (!float.IsFinite(position.X) || !float.IsFinite(position.Y) || !float.IsFinite(position.Z))
                     {
                         throw new InvalidDataException($"Skinning produced an invalid vertex in mesh {k}, vertex {i}.");
                     }
 
-                    if (bindPoseBasisReady)
-                    {
-                        Vector3 n = SafeNormalize(finalNormal);
-                        Vector3 t = SafeNormalize(finalTangent - n * Vector3.Dot(n, finalTangent));
-                        Vector3 b = SafeNormalize(Vector3.Cross(n, t));
-                        if (Vector3.Dot(b, finalBitangent) < 0f) b = -b;
-                        skinnedNormals[i] = n;
-                        skinnedTangents[i] = t;
-                        skinnedBitangents[i] = b;
-                    }
-                }
+                    // Re-orthonormalise: blending rotated bases does not preserve unit length or orthogonality.
+                    Vector3 n = SafeNormalize(normal, Vector3.UnitZ);
+                    Vector3 t = SafeNormalize(tangent - n * Vector3.Dot(n, tangent), AnyPerpendicular(n));
+                    Vector3 b = Vector3.Cross(n, t);
+                    if (Vector3.Dot(b, bitangent) < 0f) b = -b;
 
-                int count = 0;
-                // Organize the final vertices acording to the meshes triangles
-                for (int i = 0; i < model[k].NumTris; i++)
-                {
-                    int i0 = model[k].Faces[i][0];
-                    int i1 = model[k].Faces[i][1];
-                    int i2 = model[k].Faces[i][2];
-                    vertices[count + 0] = new Vertex(finalVertices[i0], skinnedNormals[i0], model[k].Verts[i0].UV, skinnedTangents[i0], skinnedBitangents[i0]);
-                    vertices[count + 1] = new Vertex(finalVertices[i1], skinnedNormals[i1], model[k].Verts[i1].UV, skinnedTangents[i1], skinnedBitangents[i1]);
-                    vertices[count + 2] = new Vertex(finalVertices[i2], skinnedNormals[i2], model[k].Verts[i2].UV, skinnedTangents[i2], skinnedBitangents[i2]);
-
-                    count += 3;
+                    output[i] = new Vertex(position, n, vert.UV, t, b);
                 }
-                meshes.Add(vertices);
             }
         }
 
+        /// <summary>
+        /// Derives smooth per-vertex normals and UV tangents in the bind pose and stores them in
+        /// each weight's joint space, so they can be skinned exactly like positions.
+        /// Normals are shared between vertices that occupy the same position (UV seams), as
+        /// Doom 3 does with its duplicated vertices, to avoid visible lighting seams.
+        /// Tangents are kept per vertex because they legitimately differ across UV seams.
+        /// </summary>
         private void InitializeBindPoseBasis()
         {
             for (int meshIndex = 0; meshIndex < numMeshes; meshIndex++)
@@ -811,6 +794,8 @@ namespace MD5Viewer
                     int i2 = mesh.Faces[triangle][2];
                     Vector3 edge1 = positions[i1] - positions[i0];
                     Vector3 edge2 = positions[i2] - positions[i0];
+
+                    // Unnormalised cross product: area-weighted face normal.
                     Vector3 faceNormal = Vector3.Cross(edge1, edge2);
                     normalAccum[i0] += faceNormal;
                     normalAccum[i1] += faceNormal;
@@ -819,29 +804,32 @@ namespace MD5Viewer
                     Vector2 duv1 = mesh.Verts[i1].UV - mesh.Verts[i0].UV;
                     Vector2 duv2 = mesh.Verts[i2].UV - mesh.Verts[i0].UV;
                     float determinant = duv1.X * duv2.Y - duv2.X * duv1.Y;
-                    if (MathF.Abs(determinant) < 0.000001f) continue;
+                    if (MathF.Abs(determinant) < 1e-12f) continue;
 
                     float inverse = 1f / determinant;
                     Vector3 tangent = (edge1 * duv2.Y - edge2 * duv1.Y) * inverse;
                     Vector3 bitangent = (edge2 * duv1.X - edge1 * duv2.X) * inverse;
-                    tangentAccum[i0] += tangent;
-                    tangentAccum[i1] += tangent;
-                    tangentAccum[i2] += tangent;
-                    bitangentAccum[i0] += bitangent;
-                    bitangentAccum[i1] += bitangent;
-                    bitangentAccum[i2] += bitangent;
+
+                    // Weight by triangle area so tiny or sliver triangles do not dominate.
+                    float weight = faceNormal.Length * MathF.Abs(determinant);
+                    float tangentScale = weight / MathF.Max(tangent.Length, 1e-12f);
+                    float bitangentScale = weight / MathF.Max(bitangent.Length, 1e-12f);
+                    tangentAccum[i0] += tangent * tangentScale;
+                    tangentAccum[i1] += tangent * tangentScale;
+                    tangentAccum[i2] += tangent * tangentScale;
+                    bitangentAccum[i0] += bitangent * bitangentScale;
+                    bitangentAccum[i1] += bitangent * bitangentScale;
+                    bitangentAccum[i2] += bitangent * bitangentScale;
                 }
+
+                Vector3[] smoothNormals = ShareNormalsAcrossSeams(positions, normalAccum);
 
                 for (int vertexIndex = 0; vertexIndex < mesh.NumVert; vertexIndex++)
                 {
-                    Vector3 n = SafeNormalize(normalAccum[vertexIndex]);
+                    Vector3 n = SafeNormalize(smoothNormals[vertexIndex], Vector3.UnitZ);
                     Vector3 t = tangentAccum[vertexIndex] - n * Vector3.Dot(n, tangentAccum[vertexIndex]);
-                    if (t.LengthSquared < 0.000001f)
-                    {
-                        t = Vector3.Cross(n, MathF.Abs(n.Z) < 0.9f ? Vector3.UnitZ : Vector3.UnitY);
-                    }
-                    t = SafeNormalize(t);
-                    Vector3 b = SafeNormalize(Vector3.Cross(n, t));
+                    t = SafeNormalize(t, AnyPerpendicular(n));
+                    Vector3 b = Vector3.Cross(n, t);
                     if (Vector3.Dot(b, bitangentAccum[vertexIndex]) < 0f) b = -b;
 
                     MD5Vertex vertex = mesh.Verts[vertexIndex];
@@ -858,8 +846,50 @@ namespace MD5Viewer
                 }
                 model[meshIndex] = mesh;
             }
+        }
 
-            bindPoseBasisReady = true;
+        private static Vector3[] ShareNormalsAcrossSeams(Vector3[] positions, Vector3[] normals)
+        {
+            // Only surfaces facing roughly the same way are merged, so back-to-back geometry that
+            // happens to share positions (thin plates, closed slits) keeps its own normals.
+            const float cell = 1e-3f;
+            const float minCosine = 0.0f;
+
+            var groups = new Dictionary<(int, int, int), List<int>>(positions.Length);
+            var keys = new (int, int, int)[positions.Length];
+
+            for (int i = 0; i < positions.Length; i++)
+            {
+                Vector3 p = positions[i];
+                var key = ((int)MathF.Round(p.X / cell), (int)MathF.Round(p.Y / cell), (int)MathF.Round(p.Z / cell));
+                keys[i] = key;
+                if (!groups.TryGetValue(key, out List<int> members))
+                {
+                    members = new List<int>(2);
+                    groups[key] = members;
+                }
+                members.Add(i);
+            }
+
+            Vector3[] result = new Vector3[positions.Length];
+            for (int i = 0; i < positions.Length; i++)
+            {
+                Vector3 own = normals[i];
+                Vector3 ownDirection = SafeNormalize(own, Vector3.Zero);
+                Vector3 shared = own;
+
+                foreach (int j in groups[keys[i]])
+                {
+                    if (j == i) continue;
+                    if (Vector3.Dot(ownDirection, SafeNormalize(normals[j], Vector3.Zero)) > minCosine)
+                    {
+                        shared += normals[j];
+                    }
+                }
+
+                result[i] = shared;
+            }
+            return result;
         }
 
         private static Vector3[] BuildPositions(MD5Mesh mesh, MD5Joint[] pose)
@@ -873,8 +903,7 @@ namespace MD5Viewer
                 {
                     MD5Weight weight = mesh.Weights[vertex.StartWeight + j];
                     MD5Joint joint = pose[weight.Joint];
-                    Vector3 weightPosition = weight.Pos;
-                    position += (joint.Pos + MyMath.RotatePoint(ref joint.Orient, ref weightPosition)) * weight.Bias;
+                    position += (joint.Pos + MyMath.RotatePoint(ref joint.Orient, ref weight.Pos)) * weight.Bias;
                 }
                 positions[i] = position;
             }
@@ -882,38 +911,34 @@ namespace MD5Viewer
             return positions;
         }
 
-        private static Vector3 SafeNormalize(Vector3 value)
+        private static Vector3 SafeNormalize(Vector3 value, Vector3 fallback)
         {
-            if (value.LengthSquared < 0.000001f)
-            {
-                return Vector3.UnitX;
-            }
-
-            value.Normalize();
-            return value;
+            float lengthSquared = value.LengthSquared;
+            return lengthSquared > 1e-12f ? value / MathF.Sqrt(lengthSquared) : fallback;
         }
 
-        public Vertex[] GetCombinedVertices()
+        private static Vector3 AnyPerpendicular(Vector3 n) =>
+            Vector3.Normalize(Vector3.Cross(n, MathF.Abs(n.Z) < 0.9f ? Vector3.UnitZ : Vector3.UnitX));
+
+        /// <summary>Axis-aligned bounds of the current skinned pose.</summary>
+        public bool TryGetBounds(out Vector3 min, out Vector3 max)
         {
-            int total = 0;
-            for (int i = 0; i < meshes.Count; i++)
+            min = new Vector3(float.MaxValue);
+            max = new Vector3(float.MinValue);
+            bool any = false;
+            foreach (Vertex[] vertices in meshVertices)
             {
-                total += meshes[i].Length;
+                foreach (Vertex v in vertices)
+                {
+                    min = Vector3.ComponentMin(min, v.Position);
+                    max = Vector3.ComponentMax(max, v.Position);
+                    any = true;
+                }
             }
-
-            Vertex[] combined = new Vertex[total];
-            int offset = 0;
-            for (int i = 0; i < meshes.Count; i++)
-            {
-                Array.Copy(meshes[i], 0, combined, offset, meshes[i].Length);
-                offset += meshes[i].Length;
-            }
-
-            return combined;
+            return any;
         }
 
-
-        private void CleanString(ref string str)
+        private static void CleanString(ref string str)
         {
             if (str == null)
             {
@@ -926,33 +951,22 @@ namespace MD5Viewer
                 str = str[..commentStart];
             }
 
-            str = str.Replace("\t", " ");
-            str = str.Replace("\"", " ");
-            str = str.Trim();
+            str = str.Replace('\t', ' ').Replace('"', ' ').Trim();
 
-            str = RemoveExtraSpaces(str);
+            while (str.Contains("  ", StringComparison.Ordinal))
+            {
+                str = str.Replace("  ", " ");
+            }
         }
 
-        //Removes all but single spaces from a string so "some string" goes to "some string"
-        private string RemoveExtraSpaces(string str)
-        {
-            if (!str.Contains("  ")) return (str);
-            return (RemoveExtraSpaces(str.Replace("  ", " ")));
-        }
-
-        private bool ParseLine(ref TextBuffer buffer, string txt, string str)
+        private static bool ParseLine(ref TextBuffer buffer, string txt, string str)
         {
             if (txt == null || str == null)
             {
                 return false;
             }
 
-            int countFloat = 0, countInt = 0;
-
             CleanString(ref txt);
-
-            txt = txt.ToLowerInvariant();
-            str = str.ToLowerInvariant();
 
             string[] splitTxt = txt.Split(' ', StringSplitOptions.RemoveEmptyEntries);
             string[] splitStr = str.Split(' ', StringSplitOptions.RemoveEmptyEntries);
@@ -962,52 +976,64 @@ namespace MD5Viewer
                 return false;
             }
 
-            for (int i = 0; i < str.Length - 1; i++)
+            int countFloat = 0, countInt = 0;
+            foreach (string token in splitStr)
             {
-                if (str[i] == '%' && str[i + 1] == 'i') countInt++;
-                if (str[i] == '%' && str[i + 1] == 'f') countFloat++;
+                if (token == "%i") countInt++;
+                else if (token == "%f") countFloat++;
             }
 
             buffer.Ints = new int[countInt];
             buffer.Floats = new float[countFloat];
-
             countFloat = countInt = 0;
 
             for (int i = 0; i < splitStr.Length; i++)
-            {   //Integer
-                if (string.Equals(splitStr[i], "%i"))
+            {
+                switch (splitStr[i])
                 {
-                    if (!int.TryParse(splitTxt[i], NumberStyles.Integer, CultureInfo.InvariantCulture, out buffer.Ints[countInt]))
-                    {
-                        return false;
-                    }
-                    countInt++;
-                }
-                else //Float
-                    if (string.Equals(splitStr[i], "%f"))
-                    {
-                        if (!float.TryParse(splitTxt[i], NumberStyles.Float, CultureInfo.InvariantCulture, out buffer.Floats[countFloat]))
-                        {
+                    case "%i":
+                        if (!int.TryParse(splitTxt[i], NumberStyles.Integer, CultureInfo.InvariantCulture, out buffer.Ints[countInt++]))
                             return false;
-                        }
-                        countFloat++;
-                    } //String
-                    else if (string.Equals(splitStr[i], "%s"))
+                        break;
+                    case "%f":
+                        if (!float.TryParse(splitTxt[i], NumberStyles.Float, CultureInfo.InvariantCulture, out buffer.Floats[countFloat++]))
+                            return false;
+                        break;
+                    case "%s":
                         buffer.String = splitTxt[i];
-                    else if (!string.Equals(splitStr[i], splitTxt[i]))
-                        return (false);
+                        break;
+                    default:
+                        // Keywords are case-insensitive; names (%s) keep their original case.
+                        if (!string.Equals(splitStr[i], splitTxt[i], StringComparison.OrdinalIgnoreCase))
+                            return false;
+                        break;
+                }
             }
-            return (true);
+            return true;
         }
 
         private static string ReadRequiredLine(StreamReader reader, string section) =>
             reader.ReadLine() ?? throw new EndOfStreamException($"Unexpected end of MD5 file while reading {section}.");
 
-        private void RequireParsed(ref TextBuffer buffer, string line, string pattern, string filename)
+        private static void RequireParsed(ref TextBuffer buffer, string line, string pattern, string filename)
         {
             if (!ParseLine(ref buffer, line, pattern))
             {
                 throw new InvalidDataException($"Invalid MD5 data in '{filename}': '{line}'.");
+            }
+        }
+
+        private static int RequireCount(int value, string what, string filename) =>
+            value >= 0 ? value : throw new InvalidDataException($"Negative {what} in '{filename}'.");
+
+        private static int RequireIndex(int value, int count, string what, string filename) =>
+            value >= 0 && value < count ? value : throw new InvalidDataException($"{what} index {value} out of range in '{filename}'.");
+
+        private static void RequireHeader(bool condition, string section, string filename)
+        {
+            if (!condition)
+            {
+                throw new InvalidDataException($"'{section}' block appears before the required header fields in '{filename}'.");
             }
         }
     }

@@ -4,41 +4,42 @@ namespace MD5Viewer
 {
     public static class MyMath
     {
-        //Computing the w-component
-        //Since we deal with only unit quaternions (their length is 1.0), we can obtain the last component with this formula
+        /// <summary>
+        /// MD5 files store only the x, y, z components of unit quaternions; w is
+        /// reconstructed from |q| = 1. Doom 3 uses the negative root.
+        /// If rounding makes |xyz| slightly exceed 1, w is 0 and xyz is renormalised
+        /// so the quaternion remains a valid rotation.
+        /// </summary>
         public static void ComputeWComponent(ref Quaternion q)
         {
-            float w = 1.0f - (q.Xyz.X * q.Xyz.X) - (q.Xyz.Y * q.Xyz.Y) - (q.Xyz.Z * q.Xyz.Z);
+            float t = 1.0f - (q.X * q.X) - (q.Y * q.Y) - (q.Z * q.Z);
 
-            if (w < 0.0f)
+            if (t <= 0.0f)
             {
                 q.W = 0.0f;
+                float len = MathF.Sqrt((q.X * q.X) + (q.Y * q.Y) + (q.Z * q.Z));
+                if (len > 0.0f)
+                {
+                    q.X /= len;
+                    q.Y /= len;
+                    q.Z /= len;
+                }
             }
             else
             {
-                q.W = -Convert.ToSingle(Math.Sqrt(w));
+                q.W = -MathF.Sqrt(t);
             }
         }
 
+        /// <summary>
+        /// Rotates v by the unit quaternion q (equivalent to q * v * conj(q)),
+        /// using the optimised form v + 2w(u x v) + 2u x (u x v).
+        /// </summary>
         public static Vector3 RotatePoint(ref Quaternion q, ref Vector3 v)
         {
-            Vector3 outv;
-            Quaternion inv = new Quaternion();
-
-            inv.X = -q.X;
-            inv.Y = -q.Y;
-            inv.Z = -q.Z;
-            inv.W = +q.W;
-
-            Quaternion norminv = Quaternion.Normalize(inv);
-            Quaternion m = MultVec(ref q, ref v);
-            Quaternion qm = Mult(ref m, ref norminv);
-
-            outv.X = qm.Xyz.X;
-            outv.Y = qm.Xyz.Y;
-            outv.Z = qm.Xyz.Z;
-
-            return outv;
+            Vector3 u = new Vector3(q.X, q.Y, q.Z);
+            Vector3 t = 2.0f * Vector3.Cross(u, v);
+            return v + (q.W * t) + Vector3.Cross(u, t);
         }
 
         public static Quaternion Normalize(ref Quaternion q)
